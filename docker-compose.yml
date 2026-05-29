@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      # Give the backend access to Docker socket so it can manage containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      - quinoa-data:/data
+    environment:
+      - PORT=8080
+      - DATA_DIR=/data
+    restart: unless-stopped
+    depends_on: []
+
+volumes:
+  quinoa-data:

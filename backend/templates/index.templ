@@ -1,0 +1,312 @@
+package templates
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/wiltsou/quinoa/internal/db"
+)
+
+templ Index(tasks []*db.Task) {
+	@Layout("Tarefas") {
+		<style>
+			.page { max-width: 860px; margin: 0 auto; padding: 32px 20px; }
+			.page-header { display: flex; align-items: center; margin-bottom: 28px; }
+			.page-header h1 { font-family: var(--font-mono); font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+			.page-header .spacer { flex: 1; }
+
+			/* New task form */
+			.form-card {
+				background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+				padding: 20px; margin-bottom: 28px; display: none;
+			}
+			.form-card.open { display: block; }
+			.form-card h2 { font-size: 14px; font-weight: 600; margin-bottom: 16px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+			.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+			/* Path picker inline */
+			.path-picker { display: flex; align-items: center; gap: 8px; }
+			.path-picker-label { font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+			/* Directory browser modal */
+			.dir-modal-overlay {
+				display: none; position: fixed; inset: 0; z-index: 200;
+				background: rgba(0,0,0,.6); align-items: center; justify-content: center;
+			}
+			.dir-modal-overlay.open { display: flex; }
+			.dir-modal {
+				background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+				width: 520px; max-width: 95vw; display: flex; flex-direction: column; max-height: 70vh;
+			}
+			.dir-modal-header {
+				padding: 14px 16px; border-bottom: 1px solid var(--border);
+				display: flex; align-items: center; gap: 8px;
+			}
+			.dir-modal-header .dir-path {
+				font-family: var(--font-mono); font-size: 12px; color: var(--muted);
+				flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+			}
+			.dir-modal-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+			.dir-entry {
+				padding: 8px 16px; cursor: pointer; font-family: var(--font-mono); font-size: 13px;
+				display: flex; align-items: center; gap: 8px;
+			}
+			.dir-entry:hover { background: var(--bg3, #21262d); }
+			.dir-entry.up { color: var(--muted); }
+			.dir-entry::before { content: '📁'; font-size: 14px; }
+			.dir-entry.up::before { content: '↑'; font-style: normal; font-size: 14px; }
+			.dir-empty { padding: 24px 16px; color: var(--muted); font-size: 13px; text-align: center; }
+			.dir-modal-footer {
+				padding: 12px 16px; border-top: 1px solid var(--border);
+				display: flex; justify-content: flex-end; gap: 8px;
+			}
+
+			/* Task list */
+			.task-table { width: 100%; border-collapse: collapse; }
+			.task-table th {
+				text-align: left; padding: 8px 12px; font-size: 11px; color: var(--muted);
+				text-transform: uppercase; letter-spacing: .3px; border-bottom: 1px solid var(--border);
+			}
+			.task-table td { padding: 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+			.task-table tr:last-child td { border-bottom: none; }
+			.task-table tr:hover td { background: var(--bg2); }
+			.task-table .mono { font-family: var(--font-mono); font-size: 12px; }
+			.empty-state { text-align: center; padding: 60px 20px; color: var(--muted); }
+			.empty-state p { margin-top: 8px; font-size: 13px; }
+		</style>
+
+		<div class="topbar">
+			<a href="/" class="logo">quinoa</a>
+			@Nav("agents")
+		</div>
+
+		<div class="page">
+			<div class="page-header">
+				<h1>Agentes</h1>
+				<div class="spacer"></div>
+				<button
+					class="primary"
+					onclick="document.getElementById('new-task-form').classList.toggle('open')"
+				>
+					+ Nova tarefa
+				</button>
+			</div>
+
+			<!-- New task form (toggled by JS) -->
+			<div id="new-task-form" class="form-card">
+				<h2>Nova Tarefa</h2>
+				<form hx-post="/tasks" hx-target="body">
+					<div class="form-row">
+						<div class="field">
+							<label>URL do repositório (git clone)</label>
+							<input type="text" name="repo_url" placeholder="https://github.com/user/repo.git"/>
+						</div>
+						<div class="field">
+							<label>Pasta local</label>
+							<div class="path-picker">
+								<input type="hidden" id="repo-path-value" name="repo_path" value=""/>
+								<span id="repo-path-label" class="path-picker-label" style="color:var(--muted)">Nenhuma pasta selecionada</span>
+								<button type="button" class="btn" style="white-space:nowrap;flex-shrink:0" onclick="openDirModal()">
+									Selecionar pasta
+								</button>
+							</div>
+						</div>
+					</div>
+					<div class="form-row">
+						<div class="field">
+							<label>Branch (opcional)</label>
+							<input type="text" name="repo_branch" placeholder="main"/>
+						</div>
+						<div class="field">
+							<label>Agente</label>
+							<select id="agent-preset" onchange="onAgentPresetChange(this)">
+								<option value="claude --dangerously-skip-permissions" selected>Claude Code</option>
+								<option value="aider --yes-always">Aider</option>
+								<option value="bash">Bash (manual)</option>
+								<option value="">Personalizado…</option>
+							</select>
+							<input type="hidden" id="agent-command-value" name="agent_command" value="claude --dangerously-skip-permissions"/>
+							<input type="text" id="agent-command-custom" placeholder="ex: meu-agente --flag" style="display:none;margin-top:6px"/>
+						</div>
+					</div>
+					<div class="field">
+						<label>Variáveis de ambiente extras (uma por linha: KEY=VALUE)</label>
+						<textarea name="env_extra" rows="3" placeholder="ANTHROPIC_API_KEY=sk-ant-...&#10;CUSTOM_VAR=value"></textarea>
+					</div>
+					<div style="display:flex;gap:8px;justify-content:flex-end">
+						<button type="button" onclick="document.getElementById('new-task-form').classList.remove('open')">Cancelar</button>
+						<button type="submit" class="primary">Iniciar</button>
+					</div>
+				</form>
+			</div>
+
+			<!-- Directory browser modal -->
+			<div id="dir-modal-overlay" class="dir-modal-overlay" onclick="onOverlayClick(event)">
+				<div class="dir-modal">
+					<div class="dir-modal-header">
+						<button type="button" class="btn" onclick="dirUp()" id="dir-up-btn" title="Pasta acima">↑</button>
+						<span class="dir-path" id="dir-current-path"></span>
+					</div>
+					<div class="dir-modal-list" id="dir-list"></div>
+					<div class="dir-modal-footer">
+						<button type="button" onclick="closeDirModal()">Cancelar</button>
+						<button type="button" class="primary" onclick="confirmDir()">Selecionar esta pasta</button>
+					</div>
+				</div>
+			</div>
+
+			<!-- Task list — HTMX refreshes every 3s -->
+			<div
+				id="task-list"
+				hx-get="/api/tasks"
+				hx-trigger="every 3s"
+				hx-swap="innerHTML"
+			>
+				@TaskRows(tasks)
+			</div>
+		</div>
+
+		<script>
+		// ── Agent preset ──────────────────────────────────────────────────
+		function onAgentPresetChange(sel) {
+			const hidden = document.getElementById('agent-command-value');
+			const custom = document.getElementById('agent-command-custom');
+			if (sel.value !== '') {
+				hidden.value = sel.value;
+				custom.style.display = 'none';
+			} else {
+				hidden.value = '';
+				custom.style.display = '';
+				custom.focus();
+				custom.oninput = function() { hidden.value = custom.value; };
+			}
+		}
+
+		// ── Directory browser ─────────────────────────────────────────────
+		let dirCurrentPath = '';
+		let dirParentPath  = '';
+
+		function openDirModal() {
+			const current = document.getElementById('repo-path-value').value;
+			navigateTo(current || null);
+			document.getElementById('dir-modal-overlay').classList.add('open');
+		}
+
+		function closeDirModal() {
+			document.getElementById('dir-modal-overlay').classList.remove('open');
+		}
+
+		function onOverlayClick(e) {
+			if (e.target === document.getElementById('dir-modal-overlay')) closeDirModal();
+		}
+
+		function dirUp() {
+			if (dirParentPath) navigateTo(dirParentPath);
+		}
+
+		function navigateTo(path) {
+			const url = '/api/fs' + (path ? '?path=' + encodeURIComponent(path) : '');
+			fetch(url)
+				.then(function(r) { return r.json(); })
+				.then(renderDir)
+				.catch(function(err) {
+					document.getElementById('dir-list').innerHTML =
+						'<div class="dir-empty">Erro ao listar pasta</div>';
+				});
+		}
+
+		function renderDir(data) {
+			dirCurrentPath = data.path;
+			dirParentPath  = data.parent || '';
+
+			document.getElementById('dir-current-path').textContent = data.path;
+			document.getElementById('dir-up-btn').disabled = !dirParentPath;
+
+			const list = document.getElementById('dir-list');
+			list.innerHTML = '';
+
+			if (!data.dirs || data.dirs.length === 0) {
+				list.innerHTML = '<div class="dir-empty">Nenhuma subpasta encontrada</div>';
+				return;
+			}
+
+			data.dirs.forEach(function(entry) {
+				const el = document.createElement('div');
+				el.className = 'dir-entry';
+				el.textContent = entry.name;
+				el.onclick = function() { navigateTo(entry.path); };
+				list.appendChild(el);
+			});
+		}
+
+		function confirmDir() {
+			const label  = document.getElementById('repo-path-label');
+			const hidden = document.getElementById('repo-path-value');
+			hidden.value      = dirCurrentPath;
+			label.textContent = dirCurrentPath;
+			label.style.color = 'var(--text)';
+			closeDirModal();
+		}
+		</script>
+	}
+}
+
+templ TaskRows(tasks []*db.Task) {
+	if len(tasks) == 0 {
+		<div class="empty-state">
+			<div style="font-size:32px">⬡</div>
+			<p>Nenhuma tarefa ainda. Crie uma para começar.</p>
+		</div>
+	} else {
+		<table class="task-table">
+			<thead>
+				<tr>
+					<th>Status</th>
+					<th>Repositório</th>
+					<th>Agente</th>
+					<th>Criado</th>
+					<th></th>
+				</tr>
+			</thead>
+			<tbody>
+				for _, t := range tasks {
+					@taskRow(t)
+				}
+			</tbody>
+		</table>
+	}
+}
+
+templ taskRow(t *db.Task) {
+	<tr>
+		<td>@StatusBadge(t.Status)</td>
+		<td class="mono">{ repoLabelTempl(t) }</td>
+		<td class="mono" style="color:var(--muted);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{ t.AgentCommand }</td>
+		<td style="color:var(--muted);font-size:12px">{ humanTime(t.CreatedAt) }</td>
+		<td style="text-align:right;white-space:nowrap">
+			<a href={ templ.SafeURL("/tasks/" + t.ID) } class="btn" style="font-size:12px">Abrir terminal →</a>
+		</td>
+	</tr>
+}
+
+templ StatusBadge(status string) {
+	<span class={ "badge " + status }>{ status }</span>
+}
+
+func repoLabelTempl(t *db.Task) string {
+	return repoLabel(t)
+}
+
+func humanTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "agora"
+	case d < time.Hour:
+		return fmt.Sprintf("há %dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("há %dh", int(d.Hours()))
+	default:
+		return t.Format("02/01 15:04")
+	}
+}

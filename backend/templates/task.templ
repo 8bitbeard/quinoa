@@ -1,0 +1,225 @@
+package templates
+
+import "github.com/wiltsou/quinoa/internal/db"
+
+templ TaskPage(t *db.Task) {
+	@Layout(repoLabelTempl(t)) {
+		<style>
+			.terminal-layout { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+			.terminal-topbar {
+				display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+				padding: 0 20px; border-bottom: 1px solid var(--border);
+				background: var(--bg2); height: 52px;
+			}
+			.terminal-topbar .logo { font-family: var(--font-mono); font-weight: 700; font-size: 16px; }
+			.terminal-topbar .sep  { color: var(--border); }
+			.terminal-topbar .repo { font-family: var(--font-mono); font-size: 13px; }
+			.terminal-topbar .spacer { flex: 1; }
+			.terminal-topbar .meta { font-size: 12px; color: var(--muted); }
+
+			#terminal-wrap {
+				flex: 1; overflow: hidden; background: #0d1117; padding: 4px;
+			}
+			#terminal-wrap .xterm { height: 100%; }
+			#terminal-wrap .xterm-viewport { overflow-y: auto !important; }
+
+			.conn-banner {
+				position: fixed; bottom: 16px; right: 16px; z-index: 100;
+				background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius);
+				padding: 10px 16px; font-size: 12px; color: var(--muted);
+				display: none; gap: 8px; align-items: center;
+			}
+			.conn-banner.visible { display: flex; }
+			.conn-banner.error   { border-color: var(--red); color: var(--red); }
+		</style>
+
+		<div class="terminal-layout">
+			<div class="terminal-topbar">
+				<a href="/" class="logo" style="color:var(--text)">quinoa</a>
+				<span class="sep">›</span>
+				<span class="repo">{ repoLabelTempl(t) }</span>
+				<div
+					id="status-badge"
+					hx-get={ "/api/tasks/" + t.ID + "/status" }
+					hx-trigger={ statusTrigger(t.Status) }
+					hx-swap="outerHTML"
+				>
+					@StatusBadge(t.Status)
+				</div>
+				<div class="spacer"></div>
+				<span class="meta">{ t.AgentCommand }</span>
+				if t.Status == "running" || t.Status == "pending" {
+					<button
+						class="danger"
+						hx-delete={ "/tasks/" + t.ID }
+						hx-confirm="Parar este agente?"
+					>
+						Parar
+					</button>
+				}
+			</div>
+
+			<div id="terminal-wrap" data-ws-url={ "/ws/tasks/" + t.ID + "/terminal" } data-status={ t.Status }></div>
+		</div>
+
+		<div id="conn-banner" class="conn-banner"></div>
+
+		<!-- xterm.js via CDN — no build step required -->
+		<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"/>
+		<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+		<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+		<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
+
+		<script>
+		(function () {
+			const wrap    = document.getElementById('terminal-wrap');
+			const banner  = document.getElementById('conn-banner');
+			const wsUrl   = wrap.dataset.wsUrl;
+			const status  = wrap.dataset.status;
+
+			// ── Notifications ──────────────────────────────────────────────
+			let taskStatus = status;
+			const repoLabel = (document.querySelector('.terminal-topbar .repo') || {}).textContent || '';
+			let idleTimer;
+			const IDLE_MS = 3 * 60 * 1000;
+
+			function resetIdle() {
+				clearTimeout(idleTimer);
+				if (taskStatus === 'running' || taskStatus === 'pending') {
+					idleTimer = setTimeout(function() {
+						if (typeof quinoaNotify === 'function')
+							quinoaNotify('Agente aguardando?', repoLabel + ' — sem atividade há 3 min', location.href);
+					}, IDLE_MS);
+				}
+			}
+
+			// Detect status badge transition to done/error via htmx polling
+			document.body.addEventListener('htmx:afterSettle', function() {
+				const badge = document.getElementById('status-badge');
+				if (!badge) return;
+				const newStatus = badge.textContent.trim();
+				if (taskStatus !== newStatus && (newStatus === 'idle' || newStatus === 'done' || newStatus === 'error' || newStatus === 'stopped')) {
+					clearTimeout(idleTimer);
+					if (typeof quinoaNotify === 'function')
+						quinoaNotify('Agente finalizado', repoLabel, location.href);
+					taskStatus = newStatus;
+				}
+			});
+
+			const term = new Terminal({
+				cursorBlink:   true,
+				fontSize:      14,
+				fontFamily:    "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace",
+				scrollback:    5000,
+				theme: {
+					background:    '#0d1117',
+					foreground:    '#e6edf3',
+					cursor:        '#58a6ff',
+					cursorAccent:  '#0d1117',
+					black:         '#0d1117',
+					red:           '#f85149',
+					green:         '#3fb950',
+					yellow:        '#d29922',
+					blue:          '#58a6ff',
+					magenta:       '#bc8cff',
+					cyan:          '#39c5cf',
+					white:         '#e6edf3',
+					brightBlack:   '#6e7681',
+					brightRed:     '#ff7b72',
+					brightGreen:   '#56d364',
+					brightYellow:  '#e3b341',
+					brightBlue:    '#79c0ff',
+					brightMagenta: '#d2a8ff',
+					brightCyan:    '#56d4dd',
+					brightWhite:   '#f0f6fc',
+				}
+			});
+
+			const fitAddon  = new FitAddon.FitAddon();
+			const linkAddon = new WebLinksAddon.WebLinksAddon();
+			term.loadAddon(fitAddon);
+			term.loadAddon(linkAddon);
+			term.open(wrap);
+			fitAddon.fit();
+			term.focus();
+
+			function showBanner(msg, isError) {
+				banner.textContent = msg;
+				banner.className   = 'conn-banner visible' + (isError ? ' error' : '');
+			}
+			function hideBanner() { banner.className = 'conn-banner'; }
+
+			let ws;
+			let reconnectTimer;
+			let intentionallyClosed = false;
+
+			function connect() {
+				const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+				ws = new WebSocket(proto + '://' + location.host + wsUrl);
+				ws.binaryType = 'arraybuffer';
+
+				ws.onopen = function () {
+					hideBanner();
+					fitAddon.fit();
+					sendResize();
+					term.focus();
+					resetIdle();
+				};
+
+				ws.onmessage = function (e) {
+					const data = e.data instanceof ArrayBuffer
+						? new Uint8Array(e.data)
+						: e.data;
+					term.write(data);
+					resetIdle();
+				};
+
+				ws.onclose = function (e) {
+					clearTimeout(idleTimer);
+					if (intentionallyClosed) return;
+					// idle = container still alive, agent just waiting for more input
+					if (taskStatus === 'done' || taskStatus === 'error' || taskStatus === 'stopped') {
+						showBanner('Sessão encerrada', false);
+					} else {
+						showBanner('Reconectando...', false);
+						reconnectTimer = setTimeout(connect, 2000);
+					}
+				};
+
+				ws.onerror = function () {
+					showBanner('Erro de conexão', true);
+				};
+			}
+
+			function sendResize() {
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+				}
+			}
+
+			term.onData(function (data) {
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					ws.send(new TextEncoder().encode(data));
+				}
+			});
+
+			term.onResize(function (size) {
+				sendResize();
+			});
+
+			window.addEventListener('resize', function () { fitAddon.fit(); });
+
+			// Delay connect slightly so container has time to start
+			setTimeout(connect, status === 'pending' ? 1500 : 0);
+		})();
+		</script>
+	}
+}
+
+func statusTrigger(status string) string {
+	if status == "running" || status == "pending" || status == "idle" {
+		return "every 2s"
+	}
+	return "none"
+}

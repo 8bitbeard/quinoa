@@ -1,0 +1,491 @@
+package templates
+
+import (
+	"fmt"
+
+	"github.com/wiltsou/quinoa/internal/db"
+)
+
+templ Board(todo, doing, review, done []*db.Story) {
+	@Layout("Board") {
+		<style>
+			/* Board layout */
+			.board-body { height: calc(100vh - 52px); display: flex; flex-direction: column; overflow: hidden; }
+			#board-poll { flex: 1; min-height: 0; overflow: hidden; }
+			.board {
+				display: grid; grid-template-columns: repeat(4, 1fr);
+				gap: 12px; padding: 16px; height: 100%; box-sizing: border-box;
+			}
+
+			/* Columns */
+			.col { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+			.col-header {
+				display: flex; align-items: center; gap: 8px; padding: 12px 14px;
+				border-bottom: 1px solid var(--border); flex-shrink: 0;
+				font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--muted);
+			}
+			.col-count { background: var(--bg3); border-radius: 20px; padding: 1px 7px; font-size: 11px; font-weight: 600; }
+			.col-spacer { flex: 1; }
+			.col-add {
+				padding: 1px 8px; font-size: 18px; line-height: 1.2; color: var(--muted);
+				background: none; border: 1px solid transparent; cursor: pointer; border-radius: var(--radius);
+			}
+			.col-add:hover { background: var(--bg3); color: var(--text); border-color: var(--border); }
+			.col-body { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+			.col-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 24px 12px; }
+
+			/* Story cards */
+			.story-card { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+			.story-card-title { font-weight: 600; font-size: 13px; line-height: 1.4; margin-bottom: 5px; }
+			.story-card-desc {
+				font-size: 12px; color: var(--muted); line-height: 1.5; margin-bottom: 8px;
+				overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+				white-space: pre-wrap;
+			}
+			.story-card-status { margin-bottom: 8px; }
+			.story-card-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+
+			/* Modal */
+			.modal-overlay {
+				display: none; position: fixed; inset: 0; z-index: 200;
+				background: rgba(0,0,0,.6); align-items: center; justify-content: center;
+			}
+			.modal-overlay.open { display: flex; }
+			.modal {
+				background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+				width: 560px; max-width: 95vw; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden;
+			}
+			.modal-header {
+				padding: 14px 16px; border-bottom: 1px solid var(--border);
+				display: flex; align-items: center; flex-shrink: 0;
+			}
+			.modal-title { font-weight: 600; font-size: 14px; flex: 1; }
+			.modal-close { background: none; border: none; color: var(--muted); font-size: 20px; cursor: pointer; padding: 0 2px; line-height: 1; }
+			.modal-close:hover { color: var(--text); }
+			.modal-body { padding: 16px; overflow-y: auto; }
+			.modal-footer { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+
+			/* Story reference block in start modal */
+			.story-ref {
+				margin: 12px 16px 0; padding: 10px 12px;
+				border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg3);
+			}
+			.story-ref-title { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+			.story-ref-desc {
+				font-size: 12px; color: var(--muted); line-height: 1.5;
+				overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+				white-space: pre-wrap;
+			}
+
+			/* Dir browser (same as index) */
+			.dir-modal-overlay {
+				display: none; position: fixed; inset: 0; z-index: 300;
+				background: rgba(0,0,0,.6); align-items: center; justify-content: center;
+			}
+			.dir-modal-overlay.open { display: flex; }
+			.dir-modal {
+				background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+				width: 520px; max-width: 95vw; display: flex; flex-direction: column; max-height: 70vh;
+			}
+			.dir-modal-header { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+			.dir-modal-header .dir-path { font-family: var(--font-mono); font-size: 12px; color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+			.dir-modal-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+			.dir-entry { padding: 8px 16px; cursor: pointer; font-family: var(--font-mono); font-size: 13px; display: flex; align-items: center; gap: 8px; }
+			.dir-entry:hover { background: var(--bg3); }
+			.dir-entry::before { content: '📁'; font-size: 14px; }
+			.dir-entry.up::before { content: '↑'; font-style: normal; font-size: 14px; }
+			.dir-empty { padding: 24px 16px; color: var(--muted); font-size: 13px; text-align: center; }
+			.dir-modal-footer { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+
+			/* Form helpers (modal forms) */
+			.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+			.path-picker { display: flex; align-items: center; gap: 8px; }
+			.path-picker-label { font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+			/* Btn sizes */
+			.btn-sm { padding: 3px 10px !important; font-size: 11px !important; }
+
+			/* Review column highlight */
+			.col-review { border-color: rgba(88,166,255,.25); }
+			.col-review .col-header { color: var(--accent); }
+
+			/* Running badge pulse */
+			@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+			.badge.running::before { animation: pulse-dot 1.5s ease-in-out infinite; }
+		</style>
+
+		<div class="topbar">
+			<a href="/" class="logo">quinoa</a>
+			@Nav("board")
+		</div>
+
+		<!-- New story modal -->
+		<div id="new-story-overlay" class="modal-overlay" onclick="if(this===event.target)closeModal('new-story-overlay')">
+			<div class="modal">
+				<div class="modal-header">
+					<span class="modal-title">Nova História</span>
+					<button class="modal-close" onclick="closeModal('new-story-overlay')">×</button>
+				</div>
+				<form hx-post="/stories" hx-target="body">
+					<div class="modal-body">
+						<div class="field">
+							<label>Título</label>
+							<input type="text" name="title" required placeholder="Ex: Implementar autenticação OAuth..."/>
+						</div>
+						<div class="field">
+							<label>Descrição / Prompt do Agente</label>
+							<textarea name="description" rows="6" placeholder="Descreva a tarefa em detalhes. Este texto serve de referência quando você atribuir um agente a esta história."></textarea>
+						</div>
+					</div>
+					<div class="modal-footer">
+						<button type="button" onclick="closeModal('new-story-overlay')">Cancelar</button>
+						<button type="submit" class="primary">Criar</button>
+					</div>
+				</form>
+			</div>
+		</div>
+
+		<!-- Start agent modal -->
+		<div id="start-modal-overlay" class="modal-overlay" onclick="if(this===event.target)closeModal('start-modal-overlay')">
+			<div class="modal">
+				<div class="modal-header">
+					<span class="modal-title">Iniciar Agente</span>
+					<button class="modal-close" onclick="closeModal('start-modal-overlay')">×</button>
+				</div>
+				<!-- Story context (readonly) -->
+				<div class="story-ref">
+					<div id="start-ref-title" class="story-ref-title"></div>
+					<div id="start-ref-desc" class="story-ref-desc"></div>
+				</div>
+				<form hx-post="/stories/start" hx-target="body">
+					<input type="hidden" id="start-story-id" name="story_id"/>
+					<div class="modal-body">
+						<div class="form-row">
+							<div class="field">
+								<label>URL do repositório (git clone)</label>
+								<input type="text" name="repo_url" placeholder="https://github.com/user/repo.git"/>
+							</div>
+							<div class="field">
+								<label>Pasta local</label>
+								<div class="path-picker">
+									<input type="hidden" id="start-repo-path" name="repo_path"/>
+									<span id="start-path-label" class="path-picker-label" style="color:var(--muted)">Nenhuma pasta selecionada</span>
+									<button type="button" class="btn" style="white-space:nowrap;flex-shrink:0" onclick="openDirModal()">Selecionar pasta</button>
+								</div>
+							</div>
+						</div>
+						<div class="form-row">
+							<div class="field">
+								<label>Branch (opcional)</label>
+								<input type="text" name="repo_branch" placeholder="main"/>
+							</div>
+							<div class="field">
+								<label>Agente</label>
+								<select id="start-agent-preset" onchange="onAgentChange(this)">
+									<option value="claude --dangerously-skip-permissions" selected>Claude Code</option>
+									<option value="aider --yes-always">Aider</option>
+									<option value="bash">Bash (manual)</option>
+									<option value="">Personalizado…</option>
+								</select>
+								<input type="hidden" id="start-agent-cmd" name="agent_command" value="claude --dangerously-skip-permissions"/>
+								<input type="text" id="start-agent-custom" placeholder="ex: meu-agente --flag" style="display:none;margin-top:6px"/>
+							</div>
+						</div>
+						<div class="field">
+							<label>Variáveis de ambiente extras (uma por linha: KEY=VALUE)</label>
+							<textarea name="env_extra" rows="3" placeholder="ANTHROPIC_API_KEY=sk-ant-...&#10;CUSTOM_VAR=value"></textarea>
+						</div>
+					</div>
+					<div class="modal-footer">
+						<button type="button" onclick="closeModal('start-modal-overlay')">Cancelar</button>
+						<button type="submit" class="primary">▶ Iniciar</button>
+					</div>
+				</form>
+			</div>
+		</div>
+
+		<!-- Dir browser modal -->
+		<div id="dir-modal-overlay" class="dir-modal-overlay" onclick="onDirOverlayClick(event)">
+			<div class="dir-modal">
+				<div class="dir-modal-header">
+					<button type="button" class="btn" onclick="dirUp()" id="dir-up-btn" title="Pasta acima">↑</button>
+					<span class="dir-path" id="dir-current-path"></span>
+				</div>
+				<div class="dir-modal-list" id="dir-list"></div>
+				<div class="dir-modal-footer">
+					<button type="button" onclick="closeDirModal()">Cancelar</button>
+					<button type="button" class="primary" onclick="confirmDir()">Selecionar esta pasta</button>
+				</div>
+			</div>
+		</div>
+
+		<div class="board-body">
+			<div id="board-poll" hx-get="/api/board" hx-trigger="every 3s" hx-swap="innerHTML">
+				@BoardCols(todo, doing, review, done)
+			</div>
+		</div>
+
+		<script>
+		// ── Modal helpers ──────────────────────────────────────────────────
+		let pollPaused = false;
+
+		htmx.on('#board-poll', 'htmx:beforeRequest', function(evt) {
+			if (pollPaused) evt.preventDefault();
+		});
+
+		function openModal(id) {
+			pollPaused = true;
+			document.getElementById(id).classList.add('open');
+		}
+
+		function closeModal(id) {
+			document.getElementById(id).classList.remove('open');
+			pollPaused = false;
+		}
+
+		// ── Notificações de status ────────────────────────────────────────
+		var _prevStatus = {};
+		htmx.on('#board-poll', 'htmx:afterSettle', function() {
+			document.querySelectorAll('.story-card[data-story-id]').forEach(function(card) {
+				var id     = card.dataset.storyId;
+				var status = card.dataset.taskStatus || '';
+				var title  = (card.querySelector('.story-card-title') || {}).textContent || id;
+				var prev   = _prevStatus[id];
+				if (prev === 'running' && (status === 'idle' || status === 'error' || status === 'stopped')) {
+					if (typeof quinoaNotify === 'function')
+						quinoaNotify('Agente finalizado', title, '/board');
+				}
+				if (status) _prevStatus[id] = status;
+			});
+		});
+
+		// ── Start agent modal ──────────────────────────────────────────────
+		function openStartModal(btn) {
+			document.getElementById('start-story-id').value    = btn.dataset.storyId;
+			document.getElementById('start-ref-title').textContent = btn.dataset.storyTitle;
+			document.getElementById('start-ref-desc').textContent  = btn.dataset.storyDesc || '';
+			// reset form fields
+			document.getElementById('start-agent-preset').value = 'claude --dangerously-skip-permissions';
+			document.getElementById('start-agent-cmd').value    = 'claude --dangerously-skip-permissions';
+			document.getElementById('start-agent-custom').style.display = 'none';
+			openModal('start-modal-overlay');
+		}
+
+		function onAgentChange(sel) {
+			const cmd    = document.getElementById('start-agent-cmd');
+			const custom = document.getElementById('start-agent-custom');
+			if (sel.value !== '') {
+				cmd.value = sel.value;
+				custom.style.display = 'none';
+			} else {
+				cmd.value = '';
+				custom.style.display = '';
+				custom.focus();
+				custom.oninput = function() { cmd.value = custom.value; };
+			}
+		}
+
+		// ── Directory browser ──────────────────────────────────────────────
+		let dirCurrentPath = '';
+		let dirParentPath  = '';
+
+		function openDirModal() {
+			const current = document.getElementById('start-repo-path').value;
+			navigateTo(current || null);
+			document.getElementById('dir-modal-overlay').classList.add('open');
+		}
+
+		function closeDirModal() {
+			document.getElementById('dir-modal-overlay').classList.remove('open');
+		}
+
+		function onDirOverlayClick(e) {
+			if (e.target === document.getElementById('dir-modal-overlay')) closeDirModal();
+		}
+
+		function dirUp() {
+			if (dirParentPath) navigateTo(dirParentPath);
+		}
+
+		function navigateTo(path) {
+			const url = '/api/fs' + (path ? '?path=' + encodeURIComponent(path) : '');
+			fetch(url)
+				.then(function(r) { return r.json(); })
+				.then(renderDir)
+				.catch(function() {
+					document.getElementById('dir-list').innerHTML = '<div class="dir-empty">Erro ao listar pasta</div>';
+				});
+		}
+
+		function renderDir(data) {
+			dirCurrentPath = data.path;
+			dirParentPath  = data.parent || '';
+			document.getElementById('dir-current-path').textContent = data.path;
+			document.getElementById('dir-up-btn').disabled = !dirParentPath;
+			const list = document.getElementById('dir-list');
+			list.innerHTML = '';
+			if (!data.dirs || data.dirs.length === 0) {
+				list.innerHTML = '<div class="dir-empty">Nenhuma subpasta encontrada</div>';
+				return;
+			}
+			data.dirs.forEach(function(entry) {
+				const el = document.createElement('div');
+				el.className = 'dir-entry';
+				el.textContent = entry.name;
+				el.onclick = function() { navigateTo(entry.path); };
+				list.appendChild(el);
+			});
+		}
+
+		function confirmDir() {
+			document.getElementById('start-repo-path').value      = dirCurrentPath;
+			document.getElementById('start-path-label').textContent = dirCurrentPath;
+			document.getElementById('start-path-label').style.color = 'var(--text)';
+			closeDirModal();
+		}
+		</script>
+	}
+}
+
+templ BoardCols(todo, doing, review, done []*db.Story) {
+	<div class="board">
+		<!-- Todo -->
+		<div class="col">
+			<div class="col-header">
+				<span>Todo</span>
+				<span class="col-count">{ fmt.Sprintf("%d", len(todo)) }</span>
+				<div class="col-spacer"></div>
+				<button class="col-add" title="Nova história" onclick="openModal('new-story-overlay')">+</button>
+			</div>
+			<div class="col-body">
+				if len(todo) == 0 {
+					<div class="col-empty">Nenhuma história. Clique em + para criar.</div>
+				}
+				for _, s := range todo {
+					@storyCard(s)
+				}
+			</div>
+		</div>
+
+		<!-- Doing -->
+		<div class="col">
+			<div class="col-header">
+				<span>Doing</span>
+				<span class="col-count">{ fmt.Sprintf("%d", len(doing)) }</span>
+			</div>
+			<div class="col-body">
+				if len(doing) == 0 {
+					<div class="col-empty">Nenhuma história em execução.</div>
+				}
+				for _, s := range doing {
+					@storyCard(s)
+				}
+			</div>
+		</div>
+
+		<!-- Review -->
+		<div class="col col-review">
+			<div class="col-header">
+				<span>Review</span>
+				<span class="col-count">{ fmt.Sprintf("%d", len(review)) }</span>
+			</div>
+			<div class="col-body">
+				if len(review) == 0 {
+					<div class="col-empty">Nenhum item aguardando revisão.</div>
+				}
+				for _, s := range review {
+					@storyCard(s)
+				}
+			</div>
+		</div>
+
+		<!-- Done -->
+		<div class="col">
+			<div class="col-header">
+				<span>Done</span>
+				<span class="col-count">{ fmt.Sprintf("%d", len(done)) }</span>
+			</div>
+			<div class="col-body">
+				if len(done) == 0 {
+					<div class="col-empty">Nenhuma história concluída.</div>
+				}
+				for _, s := range done {
+					@storyCard(s)
+				}
+			</div>
+		</div>
+	</div>
+}
+
+templ storyCard(s *db.Story) {
+	<div class="story-card" data-story-id={ s.ID } data-task-status={ s.TaskStatus }>
+		<div class="story-card-title">{ s.Title }</div>
+		if s.Description != "" {
+			<div class="story-card-desc">{ s.Description }</div>
+		}
+		if s.TaskStatus != "" {
+			<div class="story-card-status">
+				@StatusBadge(s.TaskStatus)
+			</div>
+		}
+		<div class="story-card-actions">
+			switch s.KanbanStatus {
+			case "todo":
+				<button
+					class="btn btn-sm primary"
+					data-story-id={ s.ID }
+					data-story-title={ s.Title }
+					data-story-desc={ s.Description }
+					onclick="openStartModal(this)"
+				>▶ Iniciar</button>
+				<button
+					class="btn btn-sm danger"
+					hx-delete={ "/stories/" + s.ID }
+					hx-confirm="Excluir esta história?"
+				>×</button>
+			case "doing":
+				if s.TaskID != "" {
+					<a href={ templ.SafeURL("/tasks/" + s.TaskID) } class="btn btn-sm">→ Terminal</a>
+				}
+				<button
+					class="btn btn-sm"
+					hx-post={ "/stories/" + s.ID + "/move" }
+					hx-vals={ `{"to":"todo"}` }
+				>✕ Parar</button>
+			case "review":
+				if s.TaskID != "" {
+					<a href={ templ.SafeURL("/tasks/" + s.TaskID) } class="btn btn-sm">→ Terminal</a>
+				}
+				<button
+					class="btn btn-sm primary"
+					hx-post={ "/stories/" + s.ID + "/move" }
+					hx-vals={ `{"to":"done"}` }
+				>✓ Aprovar</button>
+				<button
+					class="btn btn-sm"
+					hx-post={ "/stories/" + s.ID + "/move" }
+					hx-vals={ `{"to":"doing"}` }
+				>✎ Corrigir</button>
+				<button
+					class="btn btn-sm"
+					hx-post={ "/stories/" + s.ID + "/move" }
+					hx-vals={ `{"to":"todo"}` }
+				>↩ Reabrir</button>
+			case "done":
+				if s.TaskID != "" {
+					<a href={ templ.SafeURL("/tasks/" + s.TaskID) } class="btn btn-sm">→ Terminal</a>
+				}
+				<button
+					class="btn btn-sm"
+					hx-post={ "/stories/" + s.ID + "/move" }
+					hx-vals={ `{"to":"todo"}` }
+				>↩ Reabrir</button>
+				<button
+					class="btn btn-sm danger"
+					hx-delete={ "/stories/" + s.ID }
+					hx-confirm="Excluir esta história?"
+				>×</button>
+			}
+		</div>
+	</div>
+}
