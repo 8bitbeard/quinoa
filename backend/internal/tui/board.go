@@ -24,6 +24,13 @@ type errMsg struct{ err error }
 
 var columns = []string{"todo", "doing", "review", "done"}
 
+// ── View states ───────────────────────────────────────────────────────────────
+
+const (
+	viewBoard    = "board"
+	viewTerminal = "terminal"
+)
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type Model struct {
@@ -32,22 +39,25 @@ type Model struct {
 	stories []*db.Story
 
 	// board state
-	col    int // focused column index (0-3)
-	cursor int // focused card index within column
+	col    int
+	cursor int
+	cols   [4][]*db.Story
 
-	// derived per-render
-	cols [4][]*db.Story
-
-	// overlay
+	// overlay / forms
 	showHelp   bool
-	activeForm tea.Model // nil = no form open
-	formKind   string    // "new-story" | "start-agent"
+	activeForm tea.Model
+	formKind   string
+
+	// active terminal pane (nil = none; survives view switches so the attach
+	// stays open while the user is back on the board)
+	activeTerm *terminalPane
+	view       string // viewBoard | viewTerminal
 
 	// dimensions
 	width  int
 	height int
 
-	// expanded card
+	// expanded card description
 	expanded bool
 }
 
@@ -55,6 +65,7 @@ func NewModel(database *db.DB, runner *Runner) Model {
 	return Model{
 		db:     database,
 		runner: runner,
+		view:   viewBoard,
 	}
 }
 
@@ -84,38 +95,53 @@ func (m Model) loadStories() tea.Cmd {
 // ── Update ────────────────────────────────────────────────────────────────────
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// If a form is open, forward most events to it.
+	// ── Terminal output (regardless of active view) ───────────────────────
+	switch msg := msg.(type) {
+	case termOutputMsg:
+		if m.activeTerm != nil && msg.containerID == m.activeTerm.containerID {
+			m.activeTerm.feed(msg.data)
+			return m, m.activeTerm.listenCmd()
+		}
+		return m, nil
+
+	case termClosedMsg:
+		if m.activeTerm != nil && msg.containerID == m.activeTerm.containerID {
+			m.activeTerm.closed = true
+		}
+		return m, nil
+	}
+
+	// ── Form overlay ──────────────────────────────────────────────────────
 	if m.activeForm != nil {
 		switch msg := msg.(type) {
 		case FormCancelled:
 			m.activeForm = nil
 			return m, nil
-
 		case FormDone:
 			return m.handleFormDone(msg)
-
 		case tea.WindowSizeMsg:
 			m.width = msg.Width
 			m.height = msg.Height
-
 		case tickMsg:
 			return m, tea.Batch(m.loadStories(), tickEvery(3*time.Second))
-
 		case storiesLoadedMsg:
 			m.stories = msg
 			m.rebuildCols()
 			return m, nil
 		}
-
 		var cmd tea.Cmd
 		m.activeForm, cmd = m.activeForm.Update(msg)
 		return m, cmd
 	}
 
+	// ── Common events handled in all views ────────────────────────────────
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.activeTerm != nil {
+			m.activeTerm.resize(m.termPaneWidth(), m.termPaneHeight())
+		}
 
 	case tickMsg:
 		return m, tea.Batch(m.loadStories(), tickEvery(3*time.Second))
@@ -126,10 +152,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampCursor()
 
 	case errMsg:
-		// TODO: surface in status bar
 		_ = msg.err
 
 	case tea.KeyMsg:
+		// Ctrl+Q always switches from terminal view back to the board.
+		if m.view == viewTerminal && msg.Type == tea.KeyCtrlQ {
+			m.view = viewBoard
+			return m, nil
+		}
+		if m.view == viewTerminal {
+			return m.handleTerminalKey(msg)
+		}
 		return m.handleKey(msg)
 	}
 
@@ -170,9 +203,14 @@ func (m *Model) selectedStory() *db.Story {
 	return cards[m.cursor]
 }
 
+// ── Board key handler ─────────────────────────────────────────────────────────
+
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.Quit):
+		if m.activeTerm != nil {
+			m.activeTerm.close()
+		}
 		return m, tea.Quit
 
 	case key.Matches(msg, keys.Help):
@@ -227,13 +265,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Approve):
 		s := m.selectedStory()
-		if s != nil && m.col == 2 { // review
+		if s != nil && m.col == 2 {
 			return m, m.moveStory(s, "done")
 		}
 
 	case key.Matches(msg, keys.Fix):
 		s := m.selectedStory()
-		if s != nil && m.col == 2 { // review → doing
+		if s != nil && m.col == 2 {
 			return m, m.moveStory(s, "doing")
 		}
 
@@ -245,7 +283,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Stop):
 		s := m.selectedStory()
-		if s != nil && m.col == 1 { // doing
+		if s != nil && m.col == 1 {
 			return m, m.stopStory(s)
 		}
 
@@ -260,11 +298,45 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if s == nil || s.TaskID == "" {
 			break
 		}
-		return m, m.openTerminal(s)
+		return m.openTerminal(s)
 	}
 
 	return m, nil
 }
+
+// ── Terminal key handler ──────────────────────────────────────────────────────
+
+func (m Model) handleTerminalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.activeTerm == nil {
+		m.view = viewBoard
+		return m, nil
+	}
+
+	// Scroll controls (do NOT forward to container).
+	switch msg.Type {
+	case tea.KeyPgUp:
+		m.activeTerm.scrollOffset += m.termPaneHeight() / 2
+		return m, nil
+	case tea.KeyPgDown:
+		if m.activeTerm.scrollOffset > 0 {
+			m.activeTerm.scrollOffset -= m.termPaneHeight() / 2
+			if m.activeTerm.scrollOffset < 0 {
+				m.activeTerm.scrollOffset = 0
+			}
+		}
+		return m, nil
+	}
+
+	// All other keys go straight to the container.
+	if raw := keyToBytes(msg); len(raw) > 0 {
+		m.activeTerm.sendInput(raw)
+		// Auto-scroll to bottom when user types.
+		m.activeTerm.scrollOffset = 0
+	}
+	return m, nil
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
 
 func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 	m.activeForm = nil
@@ -332,6 +404,38 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) openTerminal(s *db.Story) (tea.Model, tea.Cmd) {
+	task, err := m.db.GetTask(s.TaskID)
+	if err != nil || task.ContainerID == "" {
+		return m, nil
+	}
+
+	// Close any previously open pane before opening a new one.
+	if m.activeTerm != nil && m.activeTerm.containerID != task.ContainerID {
+		m.activeTerm.close()
+		m.activeTerm = nil
+	}
+
+	// If already attached to the same container, just switch view.
+	if m.activeTerm != nil && m.activeTerm.containerID == task.ContainerID {
+		m.view = viewTerminal
+		m.activeTerm.scrollOffset = 0
+		return m, nil
+	}
+
+	pane, listenCmd, err := newTerminalPane(
+		s.Title, task.ContainerID, m.runner.Docker(),
+		m.termPaneWidth(), m.termPaneHeight(),
+	)
+	if err != nil {
+		return m, nil
+	}
+
+	m.activeTerm = pane
+	m.view = viewTerminal
+	return m, listenCmd
+}
+
 func (m Model) moveStory(s *db.Story, to string) tea.Cmd {
 	return func() tea.Msg {
 		taskID := s.TaskID
@@ -375,19 +479,6 @@ func (m Model) deleteStory(s *db.Story) tea.Cmd {
 	}
 }
 
-func (m Model) openTerminal(s *db.Story) tea.Cmd {
-	task, err := m.db.GetTask(s.TaskID)
-	if err != nil || task.ContainerID == "" {
-		return nil
-	}
-	cmd := newAttachExec(task.ContainerID, m.runner.Docker())
-	return tea.Exec(cmd, func(err error) tea.Msg {
-		// After detach, reload board to reflect any status changes.
-		stories, _ := m.db.ListStories()
-		return storiesLoadedMsg(stories)
-	})
-}
-
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m Model) View() string {
@@ -397,15 +488,20 @@ func (m Model) View() string {
 	if m.showHelp {
 		return m.helpView()
 	}
+	if m.view == viewTerminal && m.activeTerm != nil {
+		return m.terminalView()
+	}
 	return m.boardView()
 }
+
+// ── Board view ────────────────────────────────────────────────────────────────
 
 func (m Model) boardView() string {
 	if m.width == 0 {
 		return "carregando..."
 	}
 
-	header := m.renderHeader()
+	header := m.renderHeader(false, "")
 	hint := m.renderHint()
 	hintH := lipgloss.Height(hint)
 	headerH := lipgloss.Height(header)
@@ -417,30 +513,111 @@ func (m Model) boardView() string {
 
 	board := m.renderBoard(m.width, boardH)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		board,
-		hint,
-	)
+	return lipgloss.JoinVertical(lipgloss.Left, header, board, hint)
 }
 
-func (m Model) renderHeader() string {
-	title := lipgloss.NewStyle().
-		Foreground(colorAccent).
-		Bold(true).
-		Render("quinoa")
+// ── Terminal view ─────────────────────────────────────────────────────────────
 
-	nav := lipgloss.NewStyle().
-		Foreground(colorMuted).
-		Render("board")
+// Chrome row counts.
+const termHeaderRows = 1
+const termFooterRows = 1
 
-	sep := lipgloss.NewStyle().
-		Foreground(colorBorder).
-		Render(" · ")
+func (m Model) termPaneHeight() int {
+	h := m.height - termHeaderRows - termFooterRows - 2 // borders
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
 
-	right := lipgloss.NewStyle().
-		Foreground(colorMuted).
-		Render(time.Now().Format("15:04:05"))
+func (m Model) termPaneWidth() int {
+	w := m.width - 2 // borders
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+func (m Model) terminalView() string {
+	p := m.activeTerm
+	header := m.renderHeader(true, p.storyTitle)
+	footer := m.renderTermFooter()
+
+	paneH := m.termPaneHeight()
+	paneW := m.termPaneWidth()
+
+	lines := p.visibleLines(paneH)
+
+	// Build content: pad to pane height so the border fills correctly.
+	var sb strings.Builder
+	for i := 0; i < paneH; i++ {
+		if i < len(lines) {
+			sb.WriteString(renderTermLine(lines[i], paneW))
+		}
+		if i < paneH-1 {
+			sb.WriteByte('\n')
+		}
+	}
+
+	borderColor := colorBorder
+	if p.closed {
+		borderColor = colorMuted
+	}
+
+	pane := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Width(paneW).
+		Height(paneH).
+		Render(sb.String())
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, pane, footer)
+}
+
+func (m Model) renderTermFooter() string {
+	p := m.activeTerm
+
+	status := ""
+	if p.closed {
+		status = styleStatusStopped.Render("● encerrado")
+	} else {
+		status = styleStatusRunning.Render("● ativo")
+	}
+
+	scrollHint := ""
+	if p.scrollOffset > 0 {
+		scrollHint = styleHint.Render(fmt.Sprintf("  ↑%d linhas", p.scrollOffset))
+	}
+
+	hint := styleHintKey.Render("ctrl+q") + styleHint.Render(" voltar ao board") +
+		styleHint.Render("  pgup/pgdn") + styleHint.Render(" rolar") +
+		scrollHint
+
+	gap := m.width - lipgloss.Width(status) - lipgloss.Width(hint) - 2
+	if gap < 1 {
+		gap = 1
+	}
+
+	return " " + status + strings.Repeat(" ", gap) + hint
+}
+
+// ── Shared header ─────────────────────────────────────────────────────────────
+
+func (m Model) renderHeader(termMode bool, storyTitle string) string {
+	title := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("quinoa")
+	sep := lipgloss.NewStyle().Foreground(colorBorder).Render(" · ")
+
+	var nav string
+	if termMode {
+		nav = lipgloss.NewStyle().Foreground(colorMuted).Render("board") +
+			sep +
+			lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("terminal") +
+			styleHint.Render("  "+truncate(storyTitle, 40))
+	} else {
+		nav = lipgloss.NewStyle().Foreground(colorMuted).Render("board")
+	}
+
+	right := lipgloss.NewStyle().Foreground(colorMuted).Render(time.Now().Format("15:04:05"))
 
 	middle := title + sep + nav
 	gap := m.width - lipgloss.Width(middle) - lipgloss.Width(right) - 2
@@ -449,6 +626,8 @@ func (m Model) renderHeader() string {
 	}
 	return " " + middle + strings.Repeat(" ", gap) + right
 }
+
+// ── Board rendering ───────────────────────────────────────────────────────────
 
 func (m Model) renderHint() string {
 	colStatus := columns[m.col]
@@ -469,10 +648,7 @@ func (m Model) renderBoard(width, height int) string {
 	var rendered []string
 
 	for i, name := range colNames {
-		cards := m.cols[i]
-		focused := i == m.col
-
-		rendered = append(rendered, m.renderColumn(i, name, cards, focused, colW, height))
+		rendered = append(rendered, m.renderColumn(i, name, m.cols[i], i == m.col, colW, height))
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top,
@@ -490,7 +666,7 @@ func (m Model) renderColumn(colIdx int, name string, cards []*db.Story, focused 
 	count := fmt.Sprintf("(%d)", len(cards))
 
 	var headerStyle lipgloss.Style
-	if colIdx == 2 { // review
+	if colIdx == 2 {
 		headerStyle = styleColHeaderReview
 	} else {
 		headerStyle = styleColHeader
@@ -510,10 +686,8 @@ func (m Model) renderColumn(colIdx int, name string, cards []*db.Story, focused 
 	if len(cards) == 0 {
 		cardLines = append(cardLines, styleColEmpty.Width(width).Render("(vazio)"))
 	}
-
 	for i, s := range cards {
-		sel := focused && i == m.cursor
-		cardLines = append(cardLines, m.renderCard(s, sel, colIdx, width))
+		cardLines = append(cardLines, m.renderCard(s, focused && i == m.cursor, colIdx, width))
 	}
 
 	innerH := height - 3
@@ -521,18 +695,13 @@ func (m Model) renderColumn(colIdx int, name string, cards []*db.Story, focused 
 		innerH = 1
 	}
 	body := strings.Join(cardLines, "\n")
-	// Clip or pad height
 	lines := strings.Split(body, "\n")
 	if len(lines) > innerH {
 		lines = lines[:innerH]
 	}
 	body = strings.Join(lines, "\n")
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		divider,
-		body,
-	)
+	return lipgloss.JoinVertical(lipgloss.Left, header, divider, body)
 }
 
 func (m Model) renderCard(s *db.Story, selected bool, colIdx int, width int) string {
@@ -560,30 +729,39 @@ func (m Model) renderCard(s *db.Story, selected bool, colIdx int, width int) str
 		parts = append(parts, badge)
 	}
 
-	content := strings.Join(parts, "\n")
+	// Show indicator when this story's terminal is currently attached.
+	if m.activeTerm != nil && s.TaskID != "" {
+		task, err := m.db.GetTask(s.TaskID)
+		if err == nil && task.ContainerID == m.activeTerm.containerID {
+			indicator := styleStatusRunning.Render("⊞ terminal")
+			parts = append(parts, indicator)
+		}
+	}
 
+	content := strings.Join(parts, "\n")
 	if selected {
 		return styleCardSelected.Width(width - 2).Render(content)
 	}
 	return styleCard.Width(width - 2).Render(content)
 }
 
+// ── Help overlay ──────────────────────────────────────────────────────────────
+
 func (m Model) helpView() string {
 	sections := []struct{ title, body string }{
-		{"Navegação", "h/← l/→   mover entre colunas\nk/↑ j/↓   mover entre cards\nenter     expandir descrição"},
-		{"Ações Globais", "n         nova história\nr         refresh manual\n?         fechar ajuda\nq         sair"},
-		{"Todo", "s         iniciar agente\nx         deletar história"},
-		{"Doing", "p         parar agente → todo"},
-		{"Review", "a         aprovar → done\nf         corrigir → doing\nb         reabrir → todo"},
-		{"Done", "b         reabrir → todo\nx         deletar história"},
-		{"Formulários", "tab       próximo campo\nshift+tab campo anterior\nctrl+s    confirmar\nesc       cancelar"},
+		{"Navegação (board)", "h/← l/→     mover entre colunas\nk/↑ j/↓     mover entre cards\nenter        expandir descrição"},
+		{"Ações Globais", "n            nova história\nr            refresh manual\n?            fechar ajuda\nq            sair"},
+		{"Todo", "s            iniciar agente\nx            deletar história"},
+		{"Doing", "p            parar agente → todo\nt            abrir terminal"},
+		{"Review", "a            aprovar → done\nf            corrigir → doing\nb            reabrir → todo\nt            abrir terminal"},
+		{"Done", "b            reabrir → todo\nx            deletar história\nt            abrir terminal"},
+		{"Terminal", "ctrl+q       voltar ao board\npgup/pgdn    rolar saída\n(todo o resto é enviado ao container)"},
+		{"Formulários", "tab/shift+tab campo anterior/próximo\nctrl+s       confirmar\nesc          cancelar"},
 	}
 
 	var rows []string
 	for _, s := range sections {
-		title := styleFormTitle.Render(s.title)
-		body := styleHint.Render(s.body)
-		rows = append(rows, title+"\n"+body)
+		rows = append(rows, styleFormTitle.Render(s.title)+"\n"+styleHint.Render(s.body))
 	}
 
 	content := styleFormTitle.Render("Ajuda — quinoa TUI") + "\n\n" +
@@ -591,7 +769,7 @@ func (m Model) helpView() string {
 		styleHintKey.Render("?") + styleHint.Render(" para fechar")
 
 	w := 50
-	if m.width-8 > w {
+	if m.width/2 > w {
 		w = m.width / 2
 	}
 
@@ -626,11 +804,9 @@ func wrapText(s string, width, maxLines int) string {
 		runes := []rune(paragraph)
 		for len(runes) > 0 {
 			if len(out) >= maxLines {
-				if len(out) > 0 {
-					last := []rune(out[len(out)-1])
-					if len(last) > 3 {
-						out[len(out)-1] = string(last[:len(last)-3]) + "..."
-					}
+				last := []rune(out[len(out)-1])
+				if len(last) > 3 {
+					out[len(out)-1] = string(last[:len(last)-3]) + "..."
 				}
 				return strings.Join(out, "\n")
 			}
