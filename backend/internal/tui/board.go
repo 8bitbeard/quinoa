@@ -457,6 +457,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Approve):
 		s := m.selectedStory()
 		if s != nil && m.col == colReview {
+			triggerVaultUpdate(m.vaultPath, s.Title, s.Description, s.PrdPath, "Implementação aceita")
 			return m, m.moveStory(s, "done")
 		}
 

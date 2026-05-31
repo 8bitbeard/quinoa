@@ -132,6 +132,8 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)
 			r.verifyPRD(taskID, story.PrdPath)
 			log.Printf("task %s: refinement agent signalled done → PRD ready", taskID)
+			vaultPath, _ := r.db.GetConfig(db.ConfigVaultPath)
+			triggerVaultUpdate(vaultPath, story.Title, story.Description, story.PrdPath, "Refinamento concluído")
 		}
 	}
 }
