@@ -1,35 +1,50 @@
-.PHONY: all dev build sandbox templ deps clean
+.PHONY: all dev build sandbox templ deps clean run
 
-# Default: build everything
 all: sandbox deps templ build
 
-# Build the sandbox Docker image (agent execution environment)
 sandbox:
 	docker build -t quinoa-sandbox ./sandbox
 
-# Download Go dependencies and generate go.sum
 deps:
 	cd backend && go mod tidy
 
-# Generate Go code from .templ files (requires templ CLI)
-# Install: go install github.com/a-h/templ/cmd/templ@v0.2.793
 templ:
 	cd backend && templ generate ./templates/...
 
-# Build the backend binary
 build:
 	cd backend && go build -o ../bin/quinoa .
 
-# Run in development mode (auto-reloads on file changes if air is installed)
-# Install air: go install github.com/cosmtrek/air@latest
+# Run in desktop mode (opens browser window automatically)
+run: build
+	./bin/quinoa
+
+# Development: regenerate templates and run with auto-open browser
 dev: sandbox
 	cd backend && templ generate ./templates/... && go run .
 
-# Run via Docker Compose (production-like)
-up:
-	docker compose up --build
+# Run as headless HTTP server (no browser auto-open)
+serve: build
+	QUINOA_HEADLESS=1 ./bin/quinoa
 
-# Remove built artifacts
+# Cross-compile for Linux amd64
+release-linux:
+	cd backend && GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ../bin/quinoa-linux-amd64 .
+
+# Cross-compile for macOS amd64 (Intel)
+release-macos-intel:
+	cd backend && GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o ../bin/quinoa-macos-amd64 .
+
+# Cross-compile for macOS arm64 (Apple Silicon)
+release-macos-arm:
+	cd backend && GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o ../bin/quinoa-macos-arm64 .
+
+# Cross-compile for Windows amd64
+release-windows:
+	cd backend && GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ../bin/quinoa-windows-amd64.exe .
+
+# Build all release targets
+release: templ release-linux release-macos-intel release-macos-arm release-windows
+
 clean:
 	rm -rf bin/
 	docker rmi quinoa-sandbox 2>/dev/null || true
