@@ -59,6 +59,7 @@ type Model struct {
 	showHelp   bool
 	activeForm tea.Model
 	formKind   string
+	taskPicker *taskPicker // non-nil when terminal picker overlay is open
 
 	// vault
 	vaultPath      string
@@ -173,6 +174,23 @@ func (m Model) loadStories() tea.Cmd {
 // ── Update ────────────────────────────────────────────────────────────────────
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// ── Task picker overlay (terminal selection) ──────────────────────────
+	if m.taskPicker != nil {
+		switch msg := msg.(type) {
+		case taskPickerSelected:
+			m.taskPicker = nil
+			return m.openTerminalForTask(msg.task)
+		case taskPickerCancelled:
+			m.taskPicker = nil
+			return m, nil
+		default:
+			pickerModel, cmd := m.taskPicker.Update(msg)
+			p := pickerModel.(taskPicker)
+			m.taskPicker = &p
+			return m, cmd
+		}
+	}
+
 	// ── Vault picker overlay ──────────────────────────────────────────────
 	if m.vaultPicker != nil {
 		switch msg := msg.(type) {
@@ -490,7 +508,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if s == nil || s.TaskID == "" {
 			break
 		}
-		return m.openTerminal(s)
+		return m.openTerminalForStory(s)
+
+	case key.Matches(msg, keys.AddAgent):
+		s := m.selectedStory()
+		if s == nil || m.col != colDoing {
+			break
+		}
+		f := newStartAgentForm(s.ID, s.Title, m.width, m.height)
+		f.kind = "add-agent"
+		m.activeForm = f
+		m.formKind = "add-agent"
+		return m, f.Init()
 	}
 
 	return m, nil
@@ -632,6 +661,7 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			taskID := uuid.New().String()
 			task, err := m.runner.StartTask(docker.RunConfig{
 				TaskID:       taskID,
+				StoryID:      storyID,
 				AgentCommand: agentCmd,
 				EnvExtra:     envExtra,
 				VaultPath:    vaultPath,
@@ -645,6 +675,52 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 				return errMsg{err}
 			}
 
+			stories, _ := m.db.ListStories()
+			return storiesLoadedMsg(stories)
+		}
+
+	case "add-agent":
+		vaultPath := m.vaultPath
+		projectsPath := m.projectsPath
+		return m, func() tea.Msg {
+			storyID := msg.Fields["story_id"]
+			story, err := m.db.GetStory(storyID)
+			if err != nil {
+				return errMsg{err}
+			}
+
+			containerPRD := ""
+			if vaultPath != "" && story.PrdPath != "" {
+				if rel := strings.TrimPrefix(story.PrdPath, vaultPath); rel != story.PrdPath {
+					containerPRD = "/vault" + rel
+				}
+			}
+
+			prompt := buildAgentPrompt(story.Title, story.Description, containerPRD, projectsPath != "")
+			agentCmd := msg.Fields["agent_command"] + " " + shellQuote(prompt)
+
+			var envExtra []string
+			for _, line := range strings.Split(msg.Fields["env_extra"], "\n") {
+				line = strings.TrimSpace(line)
+				if strings.Contains(line, "=") {
+					envExtra = append(envExtra, line)
+				}
+			}
+
+			taskID := uuid.New().String()
+			_, err = m.runner.StartTask(docker.RunConfig{
+				TaskID:       taskID,
+				StoryID:      storyID,
+				AgentCommand: agentCmd,
+				EnvExtra:     envExtra,
+				VaultPath:    vaultPath,
+				ProjectsPath: projectsPath,
+			})
+			if err != nil {
+				return errMsg{err}
+			}
+
+			// Story stays in "doing"; additional task is linked via story_id.
 			stories, _ := m.db.ListStories()
 			return storiesLoadedMsg(stories)
 		}
@@ -673,9 +749,40 @@ func (m Model) containerPRDPath(hostPRD string) string {
 	return "/vault" + rel
 }
 
-func (m Model) openTerminal(s *db.Story) (tea.Model, tea.Cmd) {
-	task, err := m.db.GetTask(s.TaskID)
-	if err != nil || task.ContainerID == "" {
+// openTerminalForStory opens the terminal for a story's agent(s).
+// If multiple agents are running it shows a picker; otherwise attaches directly.
+func (m Model) openTerminalForStory(s *db.Story) (tea.Model, tea.Cmd) {
+	tasks, _ := m.db.ListTasksByStory(s.ID)
+
+	// Filter tasks that have an active container.
+	var active []*db.Task
+	for _, t := range tasks {
+		if t.ContainerID != "" && (t.Status == "running" || t.Status == "idle") {
+			active = append(active, t)
+		}
+	}
+	// Fallback: if no story-linked tasks found, try the primary task_id.
+	if len(active) == 0 {
+		if t, err := m.db.GetTask(s.TaskID); err == nil && t.ContainerID != "" {
+			active = append(active, t)
+		}
+	}
+
+	if len(active) == 0 {
+		return m, nil
+	}
+	if len(active) == 1 {
+		return m.openTerminalForTask(active[0])
+	}
+
+	// Multiple agents: show picker.
+	p := newTaskPicker(active, m.width, m.height)
+	m.taskPicker = &p
+	return m, nil
+}
+
+func (m Model) openTerminalForTask(task *db.Task) (tea.Model, tea.Cmd) {
+	if task.ContainerID == "" {
 		return m, nil
 	}
 	cmd := exec.Command("docker", "attach",
@@ -692,11 +799,8 @@ func (m Model) moveStory(s *db.Story, to string) tea.Cmd {
 		taskID := s.TaskID
 		switch to {
 		case "todo":
-			if s.TaskID != "" {
-				if task, err := m.db.GetTask(s.TaskID); err == nil && task.ContainerID != "" {
-					m.runner.StopTask(task)
-				}
-			}
+			// Stop all agents linked to this story.
+			m.runner.StopStoryTasks(s.ID)
 			taskID = ""
 		case "doing":
 			if s.TaskID != "" {
@@ -705,12 +809,8 @@ func (m Model) moveStory(s *db.Story, to string) tea.Cmd {
 				}
 			}
 		case "done":
-			if s.TaskID != "" {
-				if task, err := m.db.GetTask(s.TaskID); err == nil && task.ContainerID != "" {
-					m.runner.StopTask(task)
-					taskID = task.ID
-				}
-			}
+			// Stop all agents and keep primary task reference.
+			m.runner.StopStoryTasks(s.ID)
 		}
 		_ = m.db.UpdateStoryKanban(s.ID, to, taskID)
 		stories, _ := m.db.ListStories()
@@ -733,6 +833,9 @@ func (m Model) deleteStory(s *db.Story) tea.Cmd {
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m Model) View() string {
+	if m.taskPicker != nil {
+		return m.taskPicker.View()
+	}
 	if m.vaultPicker != nil {
 		return m.vaultPicker.View()
 	}

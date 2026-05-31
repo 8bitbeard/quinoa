@@ -11,6 +11,7 @@ type DB struct{ *sql.DB }
 
 type Task struct {
 	ID           string    `json:"id"`
+	StoryID      string    `json:"story_id"`
 	RepoURL      string    `json:"repo_url"`
 	RepoPath     string    `json:"repo_path"`
 	RepoBranch   string    `json:"repo_branch"`
@@ -76,6 +77,7 @@ func (d *DB) migrate() error {
 	}
 	// Additive column migrations (idempotent – ignore error if column exists).
 	d.Exec(`ALTER TABLE stories ADD COLUMN prd_path TEXT NOT NULL DEFAULT ''`)
+	d.Exec(`ALTER TABLE tasks ADD COLUMN story_id TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
@@ -107,9 +109,9 @@ func (d *DB) InsertTask(t *Task) error {
 	t.CreatedAt = now
 	t.UpdatedAt = now
 	_, err := d.Exec(`
-		INSERT INTO tasks (id, repo_url, repo_path, repo_branch, agent_command, container_id, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.RepoURL, t.RepoPath, t.RepoBranch, t.AgentCommand, t.ContainerID, t.Status, t.CreatedAt, t.UpdatedAt,
+		INSERT INTO tasks (id, story_id, repo_url, repo_path, repo_branch, agent_command, container_id, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.StoryID, t.RepoURL, t.RepoPath, t.RepoBranch, t.AgentCommand, t.ContainerID, t.Status, t.CreatedAt, t.UpdatedAt,
 	)
 	return err
 }
@@ -122,15 +124,35 @@ func (d *DB) UpdateTaskStatus(id, status, containerID string) error {
 
 func (d *DB) GetTask(id string) (*Task, error) {
 	row := d.QueryRow(`
-		SELECT id, repo_url, repo_path, repo_branch, agent_command, container_id, status, created_at, updated_at
+		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, container_id, status, created_at, updated_at
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
 }
 
 func (d *DB) ListTasks() ([]*Task, error) {
 	rows, err := d.Query(`
-		SELECT id, repo_url, repo_path, repo_branch, agent_command, container_id, status, created_at, updated_at
+		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, container_id, status, created_at, updated_at
 		FROM tasks ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, rows.Err()
+}
+
+func (d *DB) ListTasksByStory(storyID string) ([]*Task, error) {
+	rows, err := d.Query(`
+		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, container_id, status, created_at, updated_at
+		FROM tasks WHERE story_id=? ORDER BY created_at ASC`, storyID)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +175,7 @@ type scanner interface {
 
 func scanTask(s scanner) (*Task, error) {
 	t := &Task{}
-	err := s.Scan(&t.ID, &t.RepoURL, &t.RepoPath, &t.RepoBranch, &t.AgentCommand, &t.ContainerID, &t.Status, &t.CreatedAt, &t.UpdatedAt)
+	err := s.Scan(&t.ID, &t.StoryID, &t.RepoURL, &t.RepoPath, &t.RepoBranch, &t.AgentCommand, &t.ContainerID, &t.Status, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }
 

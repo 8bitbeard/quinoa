@@ -29,6 +29,7 @@ func (r *Runner) Docker() *docker.Client { return r.docker }
 func (r *Runner) StartTask(cfg docker.RunConfig) (*db.Task, error) {
 	task := &db.Task{
 		ID:           cfg.TaskID,
+		StoryID:      cfg.StoryID,
 		RepoURL:      cfg.RepoURL,
 		RepoPath:     cfg.RepoPath,
 		RepoBranch:   cfg.RepoBranch,
@@ -47,6 +48,16 @@ func (r *Runner) StopTask(task *db.Task) {
 		_ = r.docker.StopContainer(context.Background(), task.ContainerID)
 	}
 	_ = r.db.UpdateTaskStatus(task.ID, "stopped", task.ContainerID)
+}
+
+// StopStoryTasks stops all running or pending tasks linked to the given story.
+func (r *Runner) StopStoryTasks(storyID string) {
+	tasks, _ := r.db.ListTasksByStory(storyID)
+	for _, t := range tasks {
+		if t.Status == "running" || t.Status == "pending" {
+			r.StopTask(t)
+		}
+	}
 }
 
 func (r *Runner) runTask(cfg docker.RunConfig) {

@@ -21,6 +21,7 @@ type Client struct {
 
 type RunConfig struct {
 	TaskID       string
+	StoryID      string
 	RepoURL      string
 	RepoPath     string // local path to bind-mount at /workspace/repo (optional)
 	RepoBranch   string

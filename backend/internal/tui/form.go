@@ -131,6 +131,7 @@ var agentPresets = []string{
 type startAgentForm struct {
 	storyID    string
 	storyTitle string
+	kind       string // "start-agent" or "add-agent"
 	fields     []textinput.Model
 	focused    int
 	preset     int
@@ -160,6 +161,7 @@ func newStartAgentForm(storyID, storyTitle string, width, height int) startAgent
 	return startAgentForm{
 		storyID:    storyID,
 		storyTitle: storyTitle,
+		kind:       "start-agent",
 		fields:     fields,
 		focused:    0,
 		preset:     0,
@@ -182,9 +184,13 @@ func (f startAgentForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if agentCmd == "" {
 				return f, nil
 			}
+			kind := f.kind
+			if kind == "" {
+				kind = "start-agent"
+			}
 			return f, func() tea.Msg {
 				return FormDone{
-					Kind: "start-agent",
+					Kind: kind,
 					Fields: map[string]string{
 						"story_id":      f.storyID,
 						"agent_command": agentCmd,
