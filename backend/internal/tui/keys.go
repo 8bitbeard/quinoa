@@ -156,7 +156,8 @@ func helpText(colStatus string, hasContainer bool) string {
 
 	switch colStatus {
 	case "todo":
-		return styleHintKey.Render("R") + styleHint.Render(" refinar  ") +
+		return termHint +
+			styleHintKey.Render("R") + styleHint.Render(" refinar  ") +
 			styleHintKey.Render("s") + styleHint.Render(" iniciar  ") +
 			styleHintKey.Render("x") + styleHint.Render(" deletar  ") +
 			base

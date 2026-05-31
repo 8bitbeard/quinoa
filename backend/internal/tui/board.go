@@ -505,7 +505,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Terminal):
 		s := m.selectedStory()
-		if s == nil || s.TaskID == "" {
+		if s == nil {
 			break
 		}
 		return m.openTerminalForStory(s)
@@ -750,19 +750,20 @@ func (m Model) containerPRDPath(hostPRD string) string {
 }
 
 // openTerminalForStory opens the terminal for a story's agent(s).
-// If multiple agents are running it shows a picker; otherwise attaches directly.
+// Includes stopped/error containers so the user can inspect logs after a failure.
+// If multiple tasks have containers it shows a picker; otherwise opens directly.
 func (m Model) openTerminalForStory(s *db.Story) (tea.Model, tea.Cmd) {
 	tasks, _ := m.db.ListTasksByStory(s.ID)
 
-	// Filter tasks that have an active container.
+	// Collect any task that has a container, regardless of status.
 	var active []*db.Task
 	for _, t := range tasks {
-		if t.ContainerID != "" && (t.Status == "running" || t.Status == "idle") {
+		if t.ContainerID != "" {
 			active = append(active, t)
 		}
 	}
-	// Fallback: if no story-linked tasks found, try the primary task_id.
-	if len(active) == 0 {
+	// Fallback: primary task_id (covers stories whose task_id isn't story-linked yet).
+	if len(active) == 0 && s.TaskID != "" {
 		if t, err := m.db.GetTask(s.TaskID); err == nil && t.ContainerID != "" {
 			active = append(active, t)
 		}
@@ -785,10 +786,17 @@ func (m Model) openTerminalForTask(task *db.Task) (tea.Model, tea.Cmd) {
 	if task.ContainerID == "" {
 		return m, nil
 	}
-	cmd := exec.Command("docker", "attach",
-		"--detach-keys=ctrl-q",
-		task.ContainerID,
-	)
+	var cmd *exec.Cmd
+	if task.Status == "error" || task.Status == "stopped" {
+		// Container has exited — show logs through a pager so the user can scroll.
+		cmd = exec.Command("sh", "-c", "docker logs "+task.ContainerID+" 2>&1 | less -r")
+	} else {
+		// Container is (likely) running — attach interactively.
+		cmd = exec.Command("docker", "attach",
+			"--detach-keys=ctrl-q",
+			task.ContainerID,
+		)
+	}
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return termDetachedMsg{}
 	})
@@ -1009,9 +1017,22 @@ func (m Model) renderHeader() string {
 func (m Model) renderHint() string {
 	colStatus := columns[m.col]
 	hasContainer := false
-	if s := m.selectedStory(); s != nil && s.TaskID != "" {
-		if task, err := m.db.GetTask(s.TaskID); err == nil && task.ContainerID != "" {
-			hasContainer = true
+	if s := m.selectedStory(); s != nil {
+		if s.TaskID != "" {
+			if task, err := m.db.GetTask(s.TaskID); err == nil && task.ContainerID != "" {
+				hasContainer = true
+			}
+		}
+		// Also check story-linked tasks (covers error/stopped containers and
+		// stories moved back to todo whose task_id was cleared).
+		if !hasContainer {
+			linked, _ := m.db.ListTasksByStory(s.ID)
+			for _, t := range linked {
+				if t.ContainerID != "" {
+					hasContainer = true
+					break
+				}
+			}
 		}
 	}
 	return " " + helpText(colStatus, hasContainer)

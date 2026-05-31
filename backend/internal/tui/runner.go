@@ -44,10 +44,12 @@ func (r *Runner) StartTask(cfg docker.RunConfig) (*db.Task, error) {
 }
 
 func (r *Runner) StopTask(task *db.Task) {
+	// Update DB before stopping so runTask's WaitContainer sees "stopped" and
+	// doesn't race to overwrite the final status to "error".
+	_ = r.db.UpdateTaskStatus(task.ID, "stopped", task.ContainerID)
 	if task.ContainerID != "" {
 		_ = r.docker.StopContainer(context.Background(), task.ContainerID)
 	}
-	_ = r.db.UpdateTaskStatus(task.ID, "stopped", task.ContainerID)
 }
 
 // StopStoryTasks stops all running or pending tasks linked to the given story.
