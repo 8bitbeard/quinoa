@@ -3,11 +3,13 @@ package tui
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/wiltsou/quinoa/internal/db"
 	"github.com/wiltsou/quinoa/internal/docker"
 )
@@ -34,6 +36,7 @@ func (r *Runner) StartTask(cfg docker.RunConfig) (*db.Task, error) {
 		RepoPath:     cfg.RepoPath,
 		RepoBranch:   cfg.RepoBranch,
 		AgentCommand: cfg.AgentCommand,
+		BaseCommand:  cfg.BaseCommand,
 		Status:       "pending",
 	}
 	if err := r.db.InsertTask(task); err != nil {
@@ -62,6 +65,23 @@ func (r *Runner) StopStoryTasks(storyID string) {
 	}
 }
 
+// getStoryForTask finds the story for a task. It checks both the primary task_id
+// link (story.task_id = taskID) and the task's own story_id field, so spawned
+// parallel agents can also find their story.
+func (r *Runner) getStoryForTask(taskID string) (*db.Story, error) {
+	if story, err := r.db.GetStoryByTaskID(taskID); err == nil {
+		return story, nil
+	}
+	task, err := r.db.GetTask(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if task.StoryID == "" {
+		return nil, fmt.Errorf("task %s has no story_id", taskID)
+	}
+	return r.db.GetStory(task.StoryID)
+}
+
 func (r *Runner) runTask(cfg docker.RunConfig) {
 	ctx := context.Background()
 	taskID := cfg.TaskID
@@ -87,7 +107,7 @@ func (r *Runner) runTask(cfg docker.RunConfig) {
 			finalStatus = "idle"
 		}
 		_ = r.db.UpdateTaskStatus(taskID, finalStatus, containerID)
-		if story, sErr := r.db.GetStoryByTaskID(taskID); sErr == nil && story.KanbanStatus == "doing" {
+		if story, sErr := r.getStoryForTask(taskID); sErr == nil && story.KanbanStatus == "doing" {
 			_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
 		}
 	}
@@ -128,10 +148,27 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 
 	scanner := bufio.NewScanner(stream)
 	for scanner.Scan() {
-		if !strings.Contains(scanner.Text(), "[QUINOA:DONE]") {
+		line := scanner.Text()
+
+		// Spawn signal: [QUINOA:SPAWN:<instruction>]
+		// Only valid while the story is in "doing". The agent (started from refine→doing)
+		// emits this after analyzing the PRD to request a parallel sub-agent.
+		if idx := strings.Index(line, "[QUINOA:SPAWN:"); idx != -1 {
+			end := strings.Index(line[idx:], "]")
+			if end > 0 {
+				instruction := line[idx+len("[QUINOA:SPAWN:") : idx+end]
+				instruction = strings.TrimSpace(instruction)
+				if instruction != "" {
+					r.spawnParallelAgent(taskID, instruction)
+				}
+			}
 			continue
 		}
-		story, err := r.db.GetStoryByTaskID(taskID)
+
+		if !strings.Contains(line, "[QUINOA:DONE]") {
+			continue
+		}
+		story, err := r.getStoryForTask(taskID)
 		if err != nil {
 			continue
 		}
@@ -149,4 +186,49 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 			triggerVaultUpdate(vaultPath, story.Title, story.Description, story.PrdPath, "Refinamento concluído")
 		}
 	}
+}
+
+// spawnParallelAgent creates a new parallel agent for the same story.
+// Called when the primary doing-agent emits [QUINOA:SPAWN:<instruction>].
+func (r *Runner) spawnParallelAgent(parentTaskID, instruction string) {
+	parent, err := r.db.GetTask(parentTaskID)
+	if err != nil || parent.BaseCommand == "" || parent.StoryID == "" {
+		log.Printf("task %s: SPAWN ignored — missing base_command or story_id", parentTaskID)
+		return
+	}
+	story, err := r.db.GetStory(parent.StoryID)
+	if err != nil || story.KanbanStatus != "doing" {
+		log.Printf("task %s: SPAWN ignored — story not in doing", parentTaskID)
+		return
+	}
+
+	vaultPath, _ := r.db.GetConfig(db.ConfigVaultPath)
+	projectsPath, _ := r.db.GetConfig(db.ConfigProjectsPath)
+
+	containerPRD := ""
+	if vaultPath != "" && story.PrdPath != "" {
+		if rel := strings.TrimPrefix(story.PrdPath, vaultPath); rel != story.PrdPath {
+			containerPRD = "/vault" + rel
+		}
+	}
+
+	agentCmd := parent.BaseCommand + " " + shellQuote(instruction)
+	if containerPRD != "" {
+		agentCmd = parent.BaseCommand + " " + shellQuote(instruction+"\n\nPRD disponível em: "+containerPRD)
+	}
+
+	taskID := uuid.New().String()
+	cfg := docker.RunConfig{
+		TaskID:       taskID,
+		StoryID:      parent.StoryID,
+		AgentCommand: agentCmd,
+		BaseCommand:  parent.BaseCommand,
+		VaultPath:    vaultPath,
+		ProjectsPath: projectsPath,
+	}
+	if _, err := r.StartTask(cfg); err != nil {
+		log.Printf("task %s: SPAWN failed: %v", parentTaskID, err)
+		return
+	}
+	log.Printf("task %s: spawned parallel agent %s", parentTaskID, taskID)
 }

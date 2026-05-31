@@ -573,6 +573,14 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 				return errMsg{err}
 			}
 
+			// Stop any existing task for this story before creating a new refine task.
+			m.runner.StopStoryTasks(storyID)
+			if story.TaskID != "" {
+				if existing, err := m.db.GetTask(story.TaskID); err == nil {
+					m.runner.StopTask(existing)
+				}
+			}
+
 			hostPRD := msg.Fields["prd_path"]
 			if hostPRD != "" {
 				_ = os.MkdirAll(filepath.Dir(hostPRD), 0755)
@@ -588,7 +596,8 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			}
 
 			prompt := buildRefinementPrompt(story.Title, story.Description, containerPRD, vaultPath != "", projectsPath != "")
-			agentCmd := msg.Fields["agent_command"] + " " + shellQuote(prompt)
+			baseCmd := msg.Fields["agent_command"]
+			agentCmd := baseCmd + " " + shellQuote(prompt)
 
 			var envExtra []string
 			for _, line := range strings.Split(msg.Fields["env_extra"], "\n") {
@@ -605,7 +614,9 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			taskID := uuid.New().String()
 			task, err := m.runner.StartTask(docker.RunConfig{
 				TaskID:       taskID,
+				StoryID:      storyID,
 				AgentCommand: agentCmd,
+				BaseCommand:  baseCmd,
 				EnvExtra:     envExtra,
 				VaultPath:    vaultPath,
 				ProjectsPath: projectsPath,
@@ -648,7 +659,8 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			}
 
 			prompt := buildAgentPrompt(story.Title, story.Description, containerPRD, projectsPath != "")
-			agentCmd := msg.Fields["agent_command"] + " " + shellQuote(prompt)
+			baseCmd := msg.Fields["agent_command"]
+			agentCmd := baseCmd + " " + shellQuote(prompt)
 
 			var envExtra []string
 			for _, line := range strings.Split(msg.Fields["env_extra"], "\n") {
@@ -663,6 +675,7 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 				TaskID:       taskID,
 				StoryID:      storyID,
 				AgentCommand: agentCmd,
+				BaseCommand:  baseCmd,
 				EnvExtra:     envExtra,
 				VaultPath:    vaultPath,
 				ProjectsPath: projectsPath,
@@ -697,7 +710,8 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			}
 
 			prompt := buildAgentPrompt(story.Title, story.Description, containerPRD, projectsPath != "")
-			agentCmd := msg.Fields["agent_command"] + " " + shellQuote(prompt)
+			baseCmd := msg.Fields["agent_command"]
+			agentCmd := baseCmd + " " + shellQuote(prompt)
 
 			var envExtra []string
 			for _, line := range strings.Split(msg.Fields["env_extra"], "\n") {
@@ -712,6 +726,7 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 				TaskID:       taskID,
 				StoryID:      storyID,
 				AgentCommand: agentCmd,
+				BaseCommand:  baseCmd,
 				EnvExtra:     envExtra,
 				VaultPath:    vaultPath,
 				ProjectsPath: projectsPath,
@@ -1269,7 +1284,17 @@ func buildAgentPrompt(storyTitle, storyDesc, containerPRDPath string, hasProject
 	}
 	if containerPRDPath != "" {
 		prompt += "\n\nLeia o PRD em " + containerPRDPath + ".\n" +
-			"Ele especifica os requisitos detalhados e indica qual projeto deve ser modificado."
+			"Ele especifica os requisitos detalhados e indica qual projeto deve ser modificado.\n\n" +
+			"## Paralelismo de agentes\n\n" +
+			"Antes de começar a implementação, analise o PRD e verifique se existem partes da tarefa\n" +
+			"que podem ser desenvolvidas de forma **completamente independente** em paralelo\n" +
+			"(por exemplo: módulos distintos sem dependência entre si).\n\n" +
+			"Se sim, para cada sub-tarefa adicional emita **antes de começar seu próprio trabalho**:\n\n" +
+			"  [QUINOA:SPAWN:<instrução completa para o agente paralelo>]\n\n" +
+			"Cada instrução deve ser auto-contida: descreva o que o agente paralelo deve fazer,\n" +
+			"mencionando o PRD em " + containerPRDPath + " e o projeto relevante.\n" +
+			"Depois de emitir os spawns, execute a sua porção da tarefa normalmente.\n" +
+			"Se não houver paralelismo óbvio, omita os sinais e implemente tudo você mesmo."
 	}
 	if hasProjects {
 		prompt += "\n\nOs projetos de código estão disponíveis em /projects. " +

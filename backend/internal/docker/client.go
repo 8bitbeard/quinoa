@@ -26,6 +26,7 @@ type RunConfig struct {
 	RepoPath     string // local path to bind-mount at /workspace/repo (optional)
 	RepoBranch   string
 	AgentCommand string
+	BaseCommand  string   // agent binary + flags without the prompt (e.g. "claude --dangerously-skip-permissions")
 	EnvExtra     []string
 	VaultPath    string // Obsidian vault — bind-mounted at /vault (optional)
 	ProjectsPath string // local projects root — bind-mounted at /projects (optional)
