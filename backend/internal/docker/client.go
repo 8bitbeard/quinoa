@@ -22,10 +22,12 @@ type Client struct {
 type RunConfig struct {
 	TaskID       string
 	RepoURL      string
-	RepoPath     string // local path to bind-mount (optional)
+	RepoPath     string // local path to bind-mount at /workspace/repo (optional)
 	RepoBranch   string
 	AgentCommand string
 	EnvExtra     []string
+	VaultPath    string // Obsidian vault — bind-mounted at /vault (optional)
+	ProjectsPath string // local projects root — bind-mounted at /projects (optional)
 }
 
 func NewClient() (*Client, error) {
@@ -58,6 +60,22 @@ func (c *Client) RunTask(ctx context.Context, cfg RunConfig) (string, error) {
 			Source: cfg.RepoPath,
 			Target: "/workspace/repo",
 		}}
+	}
+
+	if cfg.VaultPath != "" {
+		hostCfg.Mounts = append(hostCfg.Mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: cfg.VaultPath,
+			Target: "/vault",
+		})
+	}
+
+	if cfg.ProjectsPath != "" {
+		hostCfg.Mounts = append(hostCfg.Mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: cfg.ProjectsPath,
+			Target: "/projects",
+		})
 	}
 
 	// Mount host Claude credentials read-only into a staging directory.

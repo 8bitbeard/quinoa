@@ -3,26 +3,29 @@ package tui
 import "github.com/charmbracelet/bubbles/key"
 
 type keyMap struct {
-	Left      key.Binding
-	Right     key.Binding
-	Up        key.Binding
-	Down      key.Binding
-	New       key.Binding
-	Start     key.Binding
-	Approve   key.Binding
-	Fix       key.Binding
-	Reopen    key.Binding
-	Stop      key.Binding
-	Delete    key.Binding
-	Expand    key.Binding
-	Terminal  key.Binding
-	Refresh   key.Binding
-	Help      key.Binding
-	Quit      key.Binding
-	Confirm   key.Binding
-	Cancel    key.Binding
-	Tab       key.Binding
-	ShiftTab  key.Binding
+	Left       key.Binding
+	Right      key.Binding
+	Up         key.Binding
+	Down       key.Binding
+	New        key.Binding
+	Start      key.Binding
+	Approve    key.Binding
+	Fix        key.Binding
+	Reopen     key.Binding
+	Stop       key.Binding
+	Delete     key.Binding
+	Expand     key.Binding
+	Terminal   key.Binding
+	Refresh    key.Binding
+	Help       key.Binding
+	Quit       key.Binding
+	Refine     key.Binding
+	SetVault    key.Binding
+	SetProjects key.Binding
+	Confirm    key.Binding
+	Cancel     key.Binding
+	Tab        key.Binding
+	ShiftTab   key.Binding
 	NextField  key.Binding
 	PrevField  key.Binding
 	OpenPicker key.Binding
@@ -93,6 +96,18 @@ var keys = keyMap{
 		key.WithKeys("q", "ctrl+c"),
 		key.WithHelp("q", "sair"),
 	),
+	Refine: key.NewBinding(
+		key.WithKeys("R"),
+		key.WithHelp("R", "refinar história"),
+	),
+	SetVault: key.NewBinding(
+		key.WithKeys("V"),
+		key.WithHelp("V", "selecionar vault"),
+	),
+	SetProjects: key.NewBinding(
+		key.WithKeys("P"),
+		key.WithHelp("P", "selecionar projetos"),
+	),
 	Confirm: key.NewBinding(
 		key.WithKeys("ctrl+s"),
 		key.WithHelp("ctrl+s", "confirmar"),
@@ -136,8 +151,15 @@ func helpText(colStatus string, hasContainer bool) string {
 
 	switch colStatus {
 	case "todo":
-		return styleHintKey.Render("s") + styleHint.Render(" iniciar  ") +
+		return styleHintKey.Render("R") + styleHint.Render(" refinar  ") +
+			styleHintKey.Render("s") + styleHint.Render(" iniciar  ") +
 			styleHintKey.Render("x") + styleHint.Render(" deletar  ") +
+			base
+	case "refine":
+		return termHint +
+			styleHintKey.Render("s") + styleHint.Render(" implementar  ") +
+			styleHintKey.Render("p") + styleHint.Render(" parar  ") +
+			styleHintKey.Render("b") + styleHint.Render(" voltar  ") +
 			base
 	case "doing":
 		return termHint +

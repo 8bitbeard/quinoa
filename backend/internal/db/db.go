@@ -25,9 +25,10 @@ type Story struct {
 	ID           string    `json:"id"`
 	Title        string    `json:"title"`
 	Description  string    `json:"description"`
-	KanbanStatus string    `json:"kanban_status"` // todo, doing, done
+	KanbanStatus string    `json:"kanban_status"` // todo, refine, doing, review, done
 	TaskID       string    `json:"task_id"`
 	TaskStatus   string    `json:"task_status"` // populated via LEFT JOIN tasks
+	PrdPath      string    `json:"prd_path"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -42,8 +43,8 @@ func New(path string) (*DB, error) {
 }
 
 func (d *DB) migrate() error {
-	_, err := d.Exec(`
-		CREATE TABLE IF NOT EXISTS tasks (
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS tasks (
 			id            TEXT PRIMARY KEY,
 			repo_url      TEXT NOT NULL DEFAULT '',
 			repo_path     TEXT NOT NULL DEFAULT '',
@@ -53,13 +54,8 @@ func (d *DB) migrate() error {
 			status        TEXT NOT NULL DEFAULT 'pending',
 			created_at    DATETIME NOT NULL,
 			updated_at    DATETIME NOT NULL
-		)
-	`)
-	if err != nil {
-		return err
-	}
-	_, err = d.Exec(`
-		CREATE TABLE IF NOT EXISTS stories (
+		)`,
+		`CREATE TABLE IF NOT EXISTS stories (
 			id            TEXT PRIMARY KEY,
 			title         TEXT NOT NULL,
 			description   TEXT NOT NULL DEFAULT '',
@@ -67,8 +63,42 @@ func (d *DB) migrate() error {
 			task_id       TEXT NOT NULL DEFAULT '',
 			created_at    DATETIME NOT NULL,
 			updated_at    DATETIME NOT NULL
-		)
-	`)
+		)`,
+		`CREATE TABLE IF NOT EXISTS config (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL DEFAULT ''
+		)`,
+	}
+	for _, s := range stmts {
+		if _, err := d.Exec(s); err != nil {
+			return err
+		}
+	}
+	// Additive column migrations (idempotent – ignore error if column exists).
+	d.Exec(`ALTER TABLE stories ADD COLUMN prd_path TEXT NOT NULL DEFAULT ''`)
+	return nil
+}
+
+const (
+	ConfigVaultPath    = "vault_path"
+	ConfigProjectsPath = "projects_path"
+)
+
+func (d *DB) GetConfig(key string) (string, error) {
+	var value string
+	err := d.QueryRow(`SELECT value FROM config WHERE key=?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+func (d *DB) SetConfig(key, value string) error {
+	_, err := d.Exec(
+		`INSERT INTO config (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		key, value,
+	)
 	return err
 }
 
@@ -143,6 +173,7 @@ func (d *DB) ListStories() ([]*Story, error) {
 	rows, err := d.Query(`
 		SELECT s.id, s.title, s.description, s.kanban_status, s.task_id,
 		       COALESCE(t.status, '') AS task_status,
+		       s.prd_path,
 		       s.created_at, s.updated_at
 		FROM stories s
 		LEFT JOIN tasks t ON s.task_id = t.id AND s.task_id != ''
@@ -155,7 +186,7 @@ func (d *DB) ListStories() ([]*Story, error) {
 	for rows.Next() {
 		s := &Story{}
 		if err := rows.Scan(&s.ID, &s.Title, &s.Description, &s.KanbanStatus, &s.TaskID,
-			&s.TaskStatus, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			&s.TaskStatus, &s.PrdPath, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		stories = append(stories, s)
@@ -167,13 +198,14 @@ func (d *DB) GetStory(id string) (*Story, error) {
 	row := d.QueryRow(`
 		SELECT s.id, s.title, s.description, s.kanban_status, s.task_id,
 		       COALESCE(t.status, '') AS task_status,
+		       s.prd_path,
 		       s.created_at, s.updated_at
 		FROM stories s
 		LEFT JOIN tasks t ON s.task_id = t.id AND s.task_id != ''
 		WHERE s.id = ?`, id)
 	s := &Story{}
 	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.KanbanStatus, &s.TaskID,
-		&s.TaskStatus, &s.CreatedAt, &s.UpdatedAt)
+		&s.TaskStatus, &s.PrdPath, &s.CreatedAt, &s.UpdatedAt)
 	return s, err
 }
 
@@ -192,12 +224,19 @@ func (d *DB) GetStoryByTaskID(taskID string) (*Story, error) {
 	row := d.QueryRow(`
 		SELECT s.id, s.title, s.description, s.kanban_status, s.task_id,
 		       COALESCE(t.status, '') AS task_status,
+		       s.prd_path,
 		       s.created_at, s.updated_at
 		FROM stories s
 		LEFT JOIN tasks t ON s.task_id = t.id AND s.task_id != ''
 		WHERE s.task_id = ?`, taskID)
 	s := &Story{}
 	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.KanbanStatus, &s.TaskID,
-		&s.TaskStatus, &s.CreatedAt, &s.UpdatedAt)
+		&s.TaskStatus, &s.PrdPath, &s.CreatedAt, &s.UpdatedAt)
 	return s, err
+}
+
+func (d *DB) UpdateStoryPRD(id, prdPath string) error {
+	_, err := d.Exec(`UPDATE stories SET prd_path=?, updated_at=? WHERE id=?`,
+		prdPath, time.Now().UTC(), id)
+	return err
 }

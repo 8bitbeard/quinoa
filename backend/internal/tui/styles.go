@@ -15,6 +15,7 @@ var (
 	colorRed     = lipgloss.Color("#f7768e")
 	colorOrange  = lipgloss.Color("#ff9e64")
 	colorCyan    = lipgloss.Color("#7dcfff")
+	colorPurple  = lipgloss.Color("#bb9af7")
 
 	styleBase = lipgloss.NewStyle().
 			Foreground(colorText).
@@ -23,6 +24,10 @@ var (
 	styleColHeader = lipgloss.NewStyle().
 			Foreground(colorMuted).
 			Bold(true)
+
+	styleColHeaderRefine = lipgloss.NewStyle().
+				Foreground(colorPurple).
+				Bold(true)
 
 	styleColHeaderReview = lipgloss.NewStyle().
 				Foreground(colorAccent).

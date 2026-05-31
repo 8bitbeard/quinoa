@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -37,7 +38,7 @@ func (r *Runner) StartTask(cfg docker.RunConfig) (*db.Task, error) {
 	if err := r.db.InsertTask(task); err != nil {
 		return nil, err
 	}
-	go r.runTask(task, cfg.EnvExtra)
+	go r.runTask(cfg)
 	return task, nil
 }
 
@@ -48,38 +49,32 @@ func (r *Runner) StopTask(task *db.Task) {
 	_ = r.db.UpdateTaskStatus(task.ID, "stopped", task.ContainerID)
 }
 
-func (r *Runner) runTask(task *db.Task, envExtra []string) {
+func (r *Runner) runTask(cfg docker.RunConfig) {
 	ctx := context.Background()
+	taskID := cfg.TaskID
 
-	containerID, err := r.docker.RunTask(ctx, docker.RunConfig{
-		TaskID:       task.ID,
-		RepoURL:      task.RepoURL,
-		RepoPath:     task.RepoPath,
-		RepoBranch:   task.RepoBranch,
-		AgentCommand: task.AgentCommand,
-		EnvExtra:     envExtra,
-	})
+	containerID, err := r.docker.RunTask(ctx, cfg)
 	if err != nil {
-		log.Printf("task %s: run error: %v", task.ID, err)
-		_ = r.db.UpdateTaskStatus(task.ID, "error", "")
+		log.Printf("task %s: run error: %v", taskID, err)
+		_ = r.db.UpdateTaskStatus(taskID, "error", "")
 		return
 	}
 
-	_ = r.db.UpdateTaskStatus(task.ID, "running", containerID)
-	log.Printf("task %s: container started: %s", task.ID, containerID[:12])
+	_ = r.db.UpdateTaskStatus(taskID, "running", containerID)
+	log.Printf("task %s: container started: %s", taskID, containerID[:12])
 
-	go r.watchForDoneSignal(task, containerID)
+	go r.watchForDoneSignal(taskID, containerID)
 
 	exitCode, err := r.docker.WaitContainer(ctx, containerID)
-	log.Printf("task %s: container exited exit=%d", task.ID, exitCode)
+	log.Printf("task %s: container exited exit=%d", taskID, exitCode)
 
-	if cur, _ := r.db.GetTask(task.ID); cur != nil && cur.Status == "running" {
+	if cur, _ := r.db.GetTask(taskID); cur != nil && cur.Status == "running" {
 		finalStatus := "error"
 		if err == nil && exitCode == 0 {
 			finalStatus = "idle"
 		}
-		_ = r.db.UpdateTaskStatus(task.ID, finalStatus, containerID)
-		if story, sErr := r.db.GetStoryByTaskID(task.ID); sErr == nil && story.KanbanStatus == "doing" {
+		_ = r.db.UpdateTaskStatus(taskID, finalStatus, containerID)
+		if story, sErr := r.db.GetStoryByTaskID(taskID); sErr == nil && story.KanbanStatus == "doing" {
 			_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
 		}
 	}
@@ -89,11 +84,31 @@ func (r *Runner) runTask(task *db.Task, envExtra []string) {
 	})
 }
 
-func (r *Runner) watchForDoneSignal(task *db.Task, containerID string) {
+// verifyPRD checks that the PRD file was actually written by the refinement agent.
+// It logs the result; callers should not treat a missing PRD as fatal since the
+// agent may have printed it to stdout instead (no-vault mode).
+func (r *Runner) verifyPRD(taskID, prdPath string) {
+	if prdPath == "" {
+		log.Printf("task %s: no PRD path configured", taskID)
+		return
+	}
+	info, err := os.Stat(prdPath)
+	if err != nil {
+		log.Printf("task %s: WARNING — PRD not found at %s: %v", taskID, prdPath, err)
+		return
+	}
+	if info.Size() == 0 {
+		log.Printf("task %s: WARNING — PRD file is empty at %s", taskID, prdPath)
+		return
+	}
+	log.Printf("task %s: PRD verified (%d bytes): %s", taskID, info.Size(), prdPath)
+}
+
+func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 	ctx := context.Background()
 	stream, err := r.docker.StreamLogs(ctx, containerID)
 	if err != nil {
-		log.Printf("task %s: watchForDoneSignal: %v", task.ID, err)
+		log.Printf("task %s: watchForDoneSignal: %v", taskID, err)
 		return
 	}
 	defer stream.Close()
@@ -103,12 +118,20 @@ func (r *Runner) watchForDoneSignal(task *db.Task, containerID string) {
 		if !strings.Contains(scanner.Text(), "[QUINOA:DONE]") {
 			continue
 		}
-		story, err := r.db.GetStoryByTaskID(task.ID)
-		if err != nil || story.KanbanStatus != "doing" {
+		story, err := r.db.GetStoryByTaskID(taskID)
+		if err != nil {
 			continue
 		}
-		_ = r.db.UpdateTaskStatus(task.ID, "idle", containerID)
-		_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
-		log.Printf("task %s: agent signalled completion → review", task.ID)
+		switch story.KanbanStatus {
+		case "doing":
+			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)
+			_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
+			log.Printf("task %s: agent signalled completion → review", taskID)
+		case "refine":
+			// Task goes idle; story stays in refine so the user can review the PRD before promoting.
+			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)
+			r.verifyPRD(taskID, story.PrdPath)
+			log.Printf("task %s: refinement agent signalled done → PRD ready", taskID)
+		}
 	}
 }

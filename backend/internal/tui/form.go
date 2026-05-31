@@ -117,12 +117,9 @@ func (f newStoryForm) View() string {
 // ── Start Agent Form ──────────────────────────────────────────────────────────
 
 const (
-	fieldRepoURL    = 0
-	fieldRepoPath   = 1
-	fieldRepoBranch = 2
-	fieldAgentCmd   = 3
-	fieldEnvExtra   = 4
-	startFieldCount = 5
+	fieldAgentCmd   = 0
+	fieldEnvExtra   = 1
+	startFieldCount = 2
 )
 
 var agentPresets = []string{
@@ -139,32 +136,26 @@ type startAgentForm struct {
 	preset     int
 	width      int
 	height     int
-
-	// Folder picker overlay (nil = closed).
-	picker    *dirPicker
 }
 
 func newStartAgentForm(storyID, storyTitle string, width, height int) startAgentForm {
-	mkInput := func(placeholder string, w int) textinput.Model {
-		ti := textinput.New()
-		ti.Placeholder = placeholder
-		ti.Width = w
-		return ti
-	}
 	fw := width - 12
 	if fw < 30 {
 		fw = 30
 	}
+	mkInput := func(placeholder string) textinput.Model {
+		ti := textinput.New()
+		ti.Placeholder = placeholder
+		ti.Width = fw
+		return ti
+	}
 
 	fields := []textinput.Model{
-		mkInput("https://github.com/user/repo.git", fw),
-		mkInput("/home/user/meu-projeto", fw),
-		mkInput("main", fw),
-		mkInput("claude --dangerously-skip-permissions", fw),
-		mkInput("ANTHROPIC_API_KEY=sk-ant-...", fw),
+		mkInput("claude --dangerously-skip-permissions"),
+		mkInput("ANTHROPIC_API_KEY=sk-ant-..."),
 	}
-	fields[0].Focus()
 	fields[fieldAgentCmd].SetValue(agentPresets[0])
+	fields[fieldAgentCmd].Focus()
 
 	return startAgentForm{
 		storyID:    storyID,
@@ -180,51 +171,15 @@ func newStartAgentForm(storyID, storyTitle string, width, height int) startAgent
 func (f startAgentForm) Init() tea.Cmd { return textinput.Blink }
 
 func (f startAgentForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// ── Dir picker overlay ────────────────────────────────────────────────
-	if f.picker != nil {
-		switch msg := msg.(type) {
-		case DirPickerDone:
-			f.fields[fieldRepoPath].SetValue(msg.Path)
-			f.picker = nil
-			// Refocus the repo path field so the user sees the result.
-			f.fields[f.focused].Blur()
-			f.focused = fieldRepoPath
-			f.fields[f.focused].Focus()
-			return f, textinput.Blink
-
-		case DirPickerCancelled:
-			f.picker = nil
-			return f, textinput.Blink
-
-		default:
-			pickerModel, cmd := f.picker.Update(msg)
-			p := pickerModel.(dirPicker)
-			f.picker = &p
-			return f, cmd
-		}
-	}
-
-	// ── Normal form update ────────────────────────────────────────────────
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, keys.Cancel):
 			return f, func() tea.Msg { return FormCancelled{} }
 
-		case key.Matches(msg, keys.OpenPicker):
-			// Open the folder picker starting from whatever is already typed.
-			dp, cmd := newDirPicker(f.fields[fieldRepoPath].Value(), f.width, f.height)
-			f.picker = &dp
-			return f, cmd
-
 		case key.Matches(msg, keys.Confirm):
 			agentCmd := strings.TrimSpace(f.fields[fieldAgentCmd].Value())
 			if agentCmd == "" {
-				return f, nil
-			}
-			repoURL := strings.TrimSpace(f.fields[fieldRepoURL].Value())
-			repoPath := strings.TrimSpace(f.fields[fieldRepoPath].Value())
-			if repoURL == "" && repoPath == "" {
 				return f, nil
 			}
 			return f, func() tea.Msg {
@@ -233,9 +188,6 @@ func (f startAgentForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					Fields: map[string]string{
 						"story_id":      f.storyID,
 						"agent_command": agentCmd,
-						"repo_url":      repoURL,
-						"repo_path":     repoPath,
-						"repo_branch":   strings.TrimSpace(f.fields[fieldRepoBranch].Value()),
 						"env_extra":     strings.TrimSpace(f.fields[fieldEnvExtra].Value()),
 					},
 				}
@@ -272,28 +224,18 @@ func (f startAgentForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (f startAgentForm) View() string {
-	// When the picker overlay is open, delegate entirely to it.
-	if f.picker != nil {
-		return f.picker.View()
-	}
-
 	labels := []string{
-		"URL do repositório (git clone)",
-		"Pasta local  " + styleHintKey.Render("ctrl+o") + styleHint.Render(" seletor"),
-		"Branch (opcional)",
 		fmt.Sprintf("Agente  [ ] ciclar preset (%d/%d)", f.preset+1, len(agentPresets)),
 		"Env vars extras (KEY=VALUE, uma por linha)",
 	}
 	var rows []string
 	for i, fi := range f.fields {
-		label := styleFormLabel.Render(labels[i])
-		rows = append(rows, label+"\n"+fi.View())
+		rows = append(rows, styleFormLabel.Render(labels[i])+"\n"+fi.View())
 	}
 
 	ref := styleHint.Render("▸ " + f.storyTitle)
 
 	hint := styleHintKey.Render("tab") + styleHint.Render(" campo  ") +
-		styleHintKey.Render("ctrl+o") + styleHint.Render(" pasta  ") +
 		styleHintKey.Render("[/]") + styleHint.Render(" preset  ") +
 		styleHintKey.Render("ctrl+s") + styleHint.Render(" iniciar  ") +
 		styleHintKey.Render("esc") + styleHint.Render(" cancelar")
@@ -307,6 +249,133 @@ func (f startAgentForm) View() string {
 		w = 50
 	}
 	return lipgloss.Place(f.width, f.height,
+		lipgloss.Center, lipgloss.Center,
+		styleFormBorder.Width(w).Render(body),
+	)
+}
+
+// ── Start Refine Form ─────────────────────────────────────────────────────────
+
+const (
+	fieldRefineAgentCmd = 0
+	fieldRefineEnvExtra = 1
+	refineFieldCount    = 2
+)
+
+type startRefineForm struct {
+	storyID    string
+	storyTitle string
+	prdPath    string // host path where the PRD will be saved (shown to user)
+	fields     []textinput.Model
+	focused    int
+	width      int
+	height     int
+}
+
+func newStartRefineForm(storyID, storyTitle, prdPath string, width, height int) startRefineForm {
+	fw := width - 12
+	if fw < 30 {
+		fw = 30
+	}
+	mkInput := func(placeholder string) textinput.Model {
+		ti := textinput.New()
+		ti.Placeholder = placeholder
+		ti.Width = fw
+		return ti
+	}
+
+	fields := []textinput.Model{
+		mkInput("claude --dangerously-skip-permissions"),
+		mkInput("ANTHROPIC_API_KEY=sk-ant-..."),
+	}
+	fields[fieldRefineAgentCmd].SetValue("claude --dangerously-skip-permissions")
+	fields[fieldRefineAgentCmd].Focus()
+
+	return startRefineForm{
+		storyID:    storyID,
+		storyTitle: storyTitle,
+		prdPath:    prdPath,
+		fields:     fields,
+		focused:    0,
+		width:      width,
+		height:     height,
+	}
+}
+
+func (rf startRefineForm) Init() tea.Cmd { return textinput.Blink }
+
+func (rf startRefineForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch {
+		case key.Matches(msg, keys.Cancel):
+			return rf, func() tea.Msg { return FormCancelled{} }
+
+		case key.Matches(msg, keys.Confirm):
+			agentCmd := strings.TrimSpace(rf.fields[fieldRefineAgentCmd].Value())
+			if agentCmd == "" {
+				return rf, nil
+			}
+			return rf, func() tea.Msg {
+				return FormDone{
+					Kind: "start-refine",
+					Fields: map[string]string{
+						"story_id":      rf.storyID,
+						"agent_command": agentCmd,
+						"env_extra":     strings.TrimSpace(rf.fields[fieldRefineEnvExtra].Value()),
+						"prd_path":      rf.prdPath,
+					},
+				}
+			}
+
+		case key.Matches(msg, keys.NextField):
+			rf.fields[rf.focused].Blur()
+			rf.focused = (rf.focused + 1) % refineFieldCount
+			rf.fields[rf.focused].Focus()
+			return rf, textinput.Blink
+
+		case key.Matches(msg, keys.PrevField):
+			rf.fields[rf.focused].Blur()
+			rf.focused = (rf.focused - 1 + refineFieldCount) % refineFieldCount
+			rf.fields[rf.focused].Focus()
+			return rf, textinput.Blink
+		}
+	}
+
+	var cmd tea.Cmd
+	rf.fields[rf.focused], cmd = rf.fields[rf.focused].Update(msg)
+	return rf, cmd
+}
+
+func (rf startRefineForm) View() string {
+	labels := []string{
+		"Agente de refinamento",
+		"Env vars extras (KEY=VALUE, uma por linha)",
+	}
+	var rows []string
+	for i, fi := range rf.fields {
+		rows = append(rows, styleFormLabel.Render(labels[i])+"\n"+fi.View())
+	}
+
+	ref := styleHint.Render("▸ " + rf.storyTitle)
+	prdLine := styleFormLabel.Render("PRD será salvo em:") + "\n" +
+		styleCardDesc.Render(rf.prdPath)
+
+	hint := styleHintKey.Render("tab") + styleHint.Render(" campo  ") +
+		styleHintKey.Render("ctrl+s") + styleHint.Render(" iniciar  ") +
+		styleHintKey.Render("esc") + styleHint.Render(" cancelar")
+
+	body := styleFormTitle.Render("Refinar História") + "\n" +
+		ref + "\n\n" +
+		strings.Join(rows, "\n\n") + "\n\n" +
+		prdLine + "\n\n" +
+		hint
+
+	w := rf.width - 8
+	if w < 50 {
+		w = 50
+	}
+	return lipgloss.Place(rf.width, rf.height,
 		lipgloss.Center, lipgloss.Center,
 		styleFormBorder.Width(w).Render(body),
 	)

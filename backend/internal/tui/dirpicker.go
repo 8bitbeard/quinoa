@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -32,28 +33,48 @@ type dirLoadedMsg struct {
 // ── dirPicker model ───────────────────────────────────────────────────────────
 
 type dirPicker struct {
-	path    string
-	parent  string
-	home    string
-	entries []string // visible directory names (hidden excluded by default)
-	cursor  int
-	width   int
-	height  int
-	err     error
+	title      string
+	path       string
+	parent     string
+	home       string
+	entries    []string // visible directory names (hidden excluded by default)
+	cursor     int
+	width      int
+	height     int
+	err        error
 	showHidden bool
+
+	// create-vault submode
+	creating    bool
+	createInput textinput.Model
+	createErr   string
 }
 
 func newDirPicker(startPath string, w, h int) (dirPicker, tea.Cmd) {
+	return newDirPickerWithTitle("Selecionar Pasta", startPath, w, h)
+}
+
+func newDirPickerWithTitle(title, startPath string, w, h int) (dirPicker, tea.Cmd) {
 	if startPath == "" {
 		home, _ := os.UserHomeDir()
 		startPath = home
 	}
 	startPath = filepath.Clean(startPath)
-	// If startPath is a file, use its directory.
 	if info, err := os.Stat(startPath); err == nil && !info.IsDir() {
 		startPath = filepath.Dir(startPath)
 	}
-	dp := dirPicker{path: startPath, width: w, height: h}
+
+	ti := textinput.New()
+	ti.Placeholder = "nome-do-vault"
+	ti.CharLimit = 64
+
+	dp := dirPicker{
+		title:       title,
+		path:        startPath,
+		width:       w,
+		height:      h,
+		createInput: ti,
+	}
 	return dp, dp.loadCmd(startPath)
 }
 
@@ -94,9 +115,14 @@ func (d dirPicker) loadCmd(path string) tea.Cmd {
 func (d dirPicker) Init() tea.Cmd { return nil }
 
 func (d dirPicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// ── Create-vault submode ──────────────────────────────────────────────
+	if d.creating {
+		return d.updateCreating(msg)
+	}
+
+	// ── Normal navigation ─────────────────────────────────────────────────
 	switch msg := msg.(type) {
 	case dirLoadedMsg:
-		// Only apply if this is for our current path (guard against stale loads).
 		if msg.path != d.path {
 			return d, nil
 		}
@@ -112,7 +138,6 @@ func (d dirPicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keys.Cancel):
 			return d, func() tea.Msg { return DirPickerCancelled{} }
 
-		// Confirm: select current directory.
 		case msg.String() == "o", msg.String() == " ", key.Matches(msg, keys.Confirm):
 			path := d.path
 			return d, func() tea.Msg { return DirPickerDone{Path: path} }
@@ -127,7 +152,6 @@ func (d dirPicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				d.cursor++
 			}
 
-		// Enter selected directory.
 		case key.Matches(msg, keys.Right), key.Matches(msg, keys.Expand):
 			if len(d.entries) > 0 {
 				next := filepath.Join(d.path, d.entries[d.cursor])
@@ -135,27 +159,105 @@ func (d dirPicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return d, d.loadCmd(next)
 			}
 
-		// Go up to parent directory.
 		case key.Matches(msg, keys.Left):
 			if d.parent != "" {
 				d.path = d.parent
 				return d, d.loadCmd(d.parent)
 			}
 
-		// Jump to home directory.
 		case msg.String() == "~":
 			if d.home != "" {
 				d.path = d.home
 				return d, d.loadCmd(d.home)
 			}
 
-		// Toggle hidden directories.
 		case msg.String() == "H":
 			d.showHidden = !d.showHidden
 			return d, d.loadCmd(d.path)
+
+		case msg.String() == "c":
+			// Enter create-vault submode.
+			inputW := d.inputWidth()
+			d.createInput.Width = inputW
+			d.createInput.SetValue("")
+			d.createErr = ""
+			d.creating = true
+			return d, d.createInput.Focus()
 		}
 	}
 	return d, nil
+}
+
+func (d dirPicker) updateCreating(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch {
+		case key.Matches(msg, keys.Cancel):
+			d.creating = false
+			d.createErr = ""
+			return d, nil
+
+		case msg.String() == "enter", key.Matches(msg, keys.Confirm):
+			name := strings.TrimSpace(d.createInput.Value())
+			if name == "" {
+				d.createErr = "informe um nome para o vault"
+				return d, nil
+			}
+			newPath := filepath.Join(d.path, name)
+			if err := createVaultStructure(newPath); err != nil {
+				d.createErr = err.Error()
+				return d, nil
+			}
+			return d, func() tea.Msg { return DirPickerDone{Path: newPath} }
+		}
+	}
+
+	var cmd tea.Cmd
+	d.createInput, cmd = d.createInput.Update(msg)
+	return d, cmd
+}
+
+// inputWidth computes the text input width for the current modal dimensions.
+func (d dirPicker) inputWidth() int {
+	modalW := d.width - 8
+	if modalW < 40 {
+		modalW = 40
+	}
+	if modalW > 80 {
+		modalW = 80
+	}
+	innerW := modalW - 4
+	if innerW-4 < 10 {
+		return 10
+	}
+	return innerW - 4
+}
+
+// ── Vault scaffolding ─────────────────────────────────────────────────────────
+
+var vaultDirs = []string{".obsidian", "PRDs", "Projects", "Resources", "Daily", "Templates"}
+
+func createVaultStructure(root string) error {
+	for _, d := range vaultDirs {
+		if err := os.MkdirAll(filepath.Join(root, d), 0755); err != nil {
+			return err
+		}
+	}
+	// Minimal Obsidian marker so the app recognises the vault immediately.
+	appJSON := []byte("{}")
+	if err := os.WriteFile(filepath.Join(root, ".obsidian", "app.json"), appJSON, 0644); err != nil {
+		return err
+	}
+	// Welcome note.
+	welcome := "# " + filepath.Base(root) + "\n\nVault criado pelo quinoa.\n\n" +
+		"## Estrutura\n\n" +
+		"- **PRDs/** — documentos de requisitos gerados pelos agentes\n" +
+		"- **Projects/** — notas de projetos\n" +
+		"- **Resources/** — referências e documentação\n" +
+		"- **Daily/** — notas diárias\n" +
+		"- **Templates/** — templates de notas\n"
+	_ = os.WriteFile(filepath.Join(root, "Index.md"), []byte(welcome), 0644)
+	return nil
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -168,20 +270,29 @@ func (d dirPicker) View() string {
 }
 
 func (d dirPicker) renderModal() string {
-	modalW := d.width - 8
+	if d.creating {
+		return d.renderCreateModal()
+	}
+	return d.renderBrowseModal()
+}
+
+func (d dirPicker) modalDimensions() (modalW, innerW int) {
+	modalW = d.width - 8
 	if modalW < 40 {
 		modalW = 40
 	}
 	if modalW > 80 {
 		modalW = 80
 	}
+	innerW = modalW - 4
+	return
+}
 
-	innerW := modalW - 4 // inside the border+padding
+func (d dirPicker) renderBrowseModal() string {
+	modalW, innerW := d.modalDimensions()
 
-	// ── Title ──
-	title := styleFormTitle.Render("Selecionar Pasta")
+	title := styleFormTitle.Render(d.title)
 
-	// ── Current path ──
 	displayPath := d.path
 	if d.home != "" {
 		displayPath = strings.Replace(displayPath, d.home, "~", 1)
@@ -192,7 +303,6 @@ func (d dirPicker) renderModal() string {
 		Foreground(colorBorder).
 		Render(strings.Repeat("─", innerW))
 
-	// ── Directory list ──
 	listHeight := d.height/2 - 8
 	if listHeight < 4 {
 		listHeight = 4
@@ -202,13 +312,11 @@ func (d dirPicker) renderModal() string {
 	}
 
 	var listLines []string
-
 	if d.err != nil {
 		listLines = append(listLines, styleStatusError.Render("erro: "+d.err.Error()))
 	} else if len(d.entries) == 0 {
 		listLines = append(listLines, styleColEmpty.Render("(nenhum subdiretório)"))
 	} else {
-		// Scroll window so cursor is always visible.
 		start, end := scrollWindow(d.cursor, len(d.entries), listHeight)
 		for i := start; i < end; i++ {
 			name := d.entries[i]
@@ -223,7 +331,6 @@ func (d dirPicker) renderModal() string {
 			}
 			listLines = append(listLines, line)
 		}
-		// Scroll indicator
 		if len(d.entries) > listHeight {
 			shown := end - start
 			indicator := styleHint.Render(
@@ -237,11 +344,11 @@ func (d dirPicker) renderModal() string {
 
 	list := strings.Join(listLines, "\n")
 
-	// ── Hints ──
-	hints := styleHintKey.Render("o") + styleHint.Render("/spc selecionar aqui  ") +
+	hints := styleHintKey.Render("o") + styleHint.Render("/spc selecionar  ") +
 		styleHintKey.Render("enter/→") + styleHint.Render(" entrar  ") +
 		styleHintKey.Render("←") + styleHint.Render(" voltar  ") +
 		styleHintKey.Render("~") + styleHint.Render(" home  ") +
+		styleHintKey.Render("c") + styleHint.Render(" criar vault  ") +
 		styleHintKey.Render("H") + styleHint.Render(" ocultos  ") +
 		styleHintKey.Render("esc") + styleHint.Render(" cancelar")
 
@@ -252,17 +359,66 @@ func (d dirPicker) renderModal() string {
 		divider + "\n\n" +
 		hints
 
-	hidden := ""
-	if d.showHidden {
-		hidden = styleHint.Render(" (+ ocultos)")
+	return styleFormBorder.Width(modalW).Render(body)
+}
+
+func (d dirPicker) renderCreateModal() string {
+	modalW, innerW := d.modalDimensions()
+
+	title := styleFormTitle.Render("Criar Novo Vault")
+
+	displayPath := d.path
+	if d.home != "" {
+		displayPath = strings.Replace(displayPath, d.home, "~", 1)
 	}
-	_ = hidden // shown via entries themselves
+	location := styleCardDesc.Render("Em: " + truncate(displayPath, innerW-4))
+
+	divider := lipgloss.NewStyle().
+		Foreground(colorBorder).
+		Render(strings.Repeat("─", innerW))
+
+	nameLabel := styleFormLabel.Render("Nome do vault:")
+
+	// Sync the input width in case the terminal was resized.
+	inp := d.createInput
+	inp.Width = innerW - 4
+	inputView := inp.View()
+
+	structureLines := []string{
+		"  ├ .obsidian/   " + styleHint.Render("(reconhecido pelo Obsidian)"),
+		"  ├ PRDs/        " + styleHint.Render("(documentos gerados pelos agentes)"),
+		"  ├ Projects/",
+		"  ├ Resources/",
+		"  ├ Daily/",
+		"  └ Templates/",
+	}
+	structure := lipgloss.NewStyle().Foreground(colorMuted).Render(
+		strings.Join(structureLines, "\n"),
+	)
+
+	var errLine string
+	if d.createErr != "" {
+		errLine = "\n" + styleStatusError.Render("✗ "+d.createErr)
+	}
+
+	hints := styleHintKey.Render("enter") + styleHint.Render(" criar  ") +
+		styleHintKey.Render("esc") + styleHint.Render(" cancelar")
+
+	body := title + "\n\n" +
+		location + "\n" +
+		divider + "\n" +
+		nameLabel + "\n" +
+		inputView + "\n" +
+		divider + "\n" +
+		structure +
+		errLine + "\n\n" +
+		hints
 
 	return styleFormBorder.Width(modalW).Render(body)
 }
 
-// scrollWindow returns the [start, end) range of entries to display so the
-// cursor is always within view.
+// ── Scroll helpers ────────────────────────────────────────────────────────────
+
 func scrollWindow(cursor, total, height int) (start, end int) {
 	if total <= height {
 		return 0, total

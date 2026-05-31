@@ -13,11 +13,26 @@ import (
 	"github.com/wiltsou/quinoa/internal/tui"
 )
 
+func setupLogging(dataDir string) func() {
+	logPath := filepath.Join(dataDir, "quinoa.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return func() {}
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.Printf("quinoa started (log: %s)", logPath)
+	return func() { f.Close() }
+}
+
 func main() {
 	dataDir := dataDirectory()
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		log.Fatalf("data dir: %v", err)
 	}
+
+	closeLog := setupLogging(dataDir)
+	defer closeLog()
 
 	database, err := db.New(filepath.Join(dataDir, "quinoa.db"))
 	if err != nil {

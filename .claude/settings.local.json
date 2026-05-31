@@ -6,7 +6,12 @@
       "Bash(~/.asdf/shims/go run *)",
       "Bash(curl -s http://localhost:8080/health)",
       "Bash(go build *)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(go get *)",
+      "Bash(git -C /home/wiltsou/Projects/quinoa status)",
+      "Bash(git -C /home/wiltsou/Projects/quinoa log --oneline -5)",
+      "Bash(git *)",
+      "Bash(go vet *)"
     ]
   }
 }

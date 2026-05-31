@@ -16,20 +16,54 @@ fi
 
 echo "[quinoa] configurando credenciais do agente..."
 
-# Mark the workspace as trusted in ~/.claude.json so Claude Code does not
-# show the "Do you trust the files in this folder?" dialog.
-if [ -f "$HOME/.claude.json" ]; then
-    jq --arg p "$WORK_DIR" \
-        '(.projects[$p] // {}) + {"hasTrustDialogAccepted":true} as $proj
-         | .projects = ((.projects // {}) + {($p): $proj})' \
-        "$HOME/.claude.json" > /tmp/.cj.tmp && mv /tmp/.cj.tmp "$HOME/.claude.json" || true
-else
-    printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$WORK_DIR" > "$HOME/.claude.json"
+# Mark the workspace (and /projects if present) as trusted in ~/.claude.json
+# so Claude Code does not show the "Do you trust the files in this folder?" dialog.
+trust_path() {
+    local p="$1"
+    if [ -f "$HOME/.claude.json" ]; then
+        jq --arg p "$p" \
+            '(.projects[$p] // {}) + {"hasTrustDialogAccepted":true} as $proj
+             | .projects = ((.projects // {}) + {($p): $proj})' \
+            "$HOME/.claude.json" > /tmp/.cj.tmp && mv /tmp/.cj.tmp "$HOME/.claude.json" || true
+    else
+        printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$p" > "$HOME/.claude.json"
+    fi
+}
+
+trust_path "$WORK_DIR"
+if [[ -d "/projects" ]]; then
+    trust_path "/projects"
 fi
 
 echo "[quinoa] iniciando setup..."
 
-if [[ -n "${REPO_URL:-}" ]]; then
+if [[ "${QUINOA_MODE:-}" == "refine" ]]; then
+    # Refinement mode: work from the vault so the agent can read notes and write PRDs.
+    if [[ -d "/vault" ]]; then
+        WORK_DIR="/vault"
+        echo "[quinoa] modo refinamento — diretório de trabalho: /vault"
+    else
+        WORK_DIR="/tmp/workspace"
+        mkdir -p "$WORK_DIR"
+        echo "[quinoa] modo refinamento — sem vault, usando diretório temporário"
+    fi
+
+    # Optionally clone a code repo so the agent can read the codebase for context.
+    if [[ -n "${REPO_URL:-}" ]]; then
+        echo "[quinoa] clonando repositório de código para contexto do refinamento..."
+        if [[ -n "${REPO_BRANCH:-}" ]]; then
+            git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" /workspace/repo 2>&1 \
+                || echo "[quinoa] aviso: não foi possível clonar $REPO_URL"
+        else
+            git clone --depth=1 "$REPO_URL" /workspace/repo 2>&1 \
+                || echo "[quinoa] aviso: não foi possível clonar $REPO_URL"
+        fi
+    fi
+    if [[ -d "/workspace/repo" ]]; then
+        echo "[quinoa] código disponível em /workspace/repo"
+    fi
+
+elif [[ -n "${REPO_URL:-}" ]]; then
     echo "[quinoa] clonando $REPO_URL"
     if [[ -n "${REPO_BRANCH:-}" ]]; then
         git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" "$WORK_DIR"
@@ -39,8 +73,13 @@ if [[ -n "${REPO_URL:-}" ]]; then
 elif [[ -d "/workspace/repo" ]]; then
     echo "[quinoa] usando repo montado em /workspace/repo"
     WORK_DIR="/workspace/repo"
+elif [[ -d "/projects" ]]; then
+    # Projects-folder mode: agent reads PRD and navigates to the right project.
+    WORK_DIR="/tmp/quinoa-workspace"
+    mkdir -p "$WORK_DIR"
+    echo "[quinoa] modo projetos — diretório de trabalho: $WORK_DIR (projetos em /projects)"
 else
-    echo "[quinoa] ERRO: nenhum REPO_URL definido e nenhum repo montado em /workspace/repo"
+    echo "[quinoa] ERRO: nenhum REPO_URL definido e nenhuma pasta montada em /workspace/repo ou /projects"
     exit 1
 fi
 
@@ -50,7 +89,13 @@ echo ""
 
 # Inject task-completion signal instructions into CLAUDE.md so the agent
 # can notify the quinoa board when it finishes.
-cat >> CLAUDE.md 2>/dev/null << 'QUINOA_INSTRUCTIONS'
+# For refine mode, write to a temporary file (no project CLAUDE.md to append to).
+CLAUDE_INSTRUCTIONS_FILE="CLAUDE.md"
+if [[ "${QUINOA_MODE:-}" == "refine" ]]; then
+    CLAUDE_INSTRUCTIONS_FILE="/tmp/CLAUDE-quinoa.md"
+fi
+
+cat >> "$CLAUDE_INSTRUCTIONS_FILE" 2>/dev/null << 'QUINOA_INSTRUCTIONS'
 
 ## Quinoa Board Integration (required)
 When you have **fully completed** the requested task, you MUST execute the following

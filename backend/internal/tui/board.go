@@ -2,6 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -19,17 +24,24 @@ import (
 type tickMsg time.Time
 type storiesLoadedMsg []*db.Story
 type errMsg struct{ err error }
+type termDetachedMsg struct{}
+type vaultLoadedMsg struct{ path string }
+type vaultInfoMsg struct{ noteCount int }
+type projectsLoadedMsg struct{ path string }
+type projectsInfoMsg struct{ count int }
+type statusClearMsg struct{}
 
 // ── Board columns ─────────────────────────────────────────────────────────────
 
-var columns = []string{"todo", "doing", "review", "done"}
-
-// ── View states ───────────────────────────────────────────────────────────────
-
 const (
-	viewBoard    = "board"
-	viewTerminal = "terminal"
+	colTodo   = 0
+	colRefine = 1
+	colDoing  = 2
+	colReview = 3
+	colDone   = 4
 )
+
+var columns = []string{"todo", "refine", "doing", "review", "done"}
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
@@ -41,17 +53,22 @@ type Model struct {
 	// board state
 	col    int
 	cursor int
-	cols   [4][]*db.Story
+	cols   [5][]*db.Story
 
 	// overlay / forms
 	showHelp   bool
 	activeForm tea.Model
 	formKind   string
 
-	// active terminal pane (nil = none; survives view switches so the attach
-	// stays open while the user is back on the board)
-	activeTerm *terminalPane
-	view       string // viewBoard | viewTerminal
+	// vault
+	vaultPath      string
+	vaultNoteCount int        // -1 = not yet counted
+	vaultPicker    *dirPicker // non-nil when the V picker overlay is open
+
+	// projects
+	projectsPath   string
+	projectsCount  int        // -1 = not yet counted
+	projectsPicker *dirPicker // non-nil when the P picker overlay is open
 
 	// dimensions
 	width  int
@@ -59,13 +76,33 @@ type Model struct {
 
 	// expanded card description
 	expanded bool
+
+	// transient status/error banner (auto-clears after 5s)
+	statusMsg string
 }
 
 func NewModel(database *db.DB, runner *Runner) Model {
 	return Model{
-		db:     database,
-		runner: runner,
-		view:   viewBoard,
+		db:             database,
+		runner:         runner,
+		vaultNoteCount: -1,
+		projectsCount:  -1,
+	}
+}
+
+func countVaultNotes(vaultPath string) tea.Cmd {
+	return func() tea.Msg {
+		count := 0
+		_ = filepath.Walk(vaultPath, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".md") {
+				count++
+			}
+			return nil
+		})
+		return vaultInfoMsg{noteCount: count}
 	}
 }
 
@@ -74,12 +111,53 @@ func NewModel(database *db.DB, runner *Runner) Model {
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.loadStories(),
+		m.loadVaultConfig(),
+		m.loadProjectsConfig(),
 		tickEvery(3*time.Second),
 	)
 }
 
+func (m Model) loadVaultConfig() tea.Cmd {
+	return func() tea.Msg {
+		path, _ := m.db.GetConfig(db.ConfigVaultPath)
+		return vaultLoadedMsg{path: path}
+	}
+}
+
+func (m Model) loadProjectsConfig() tea.Cmd {
+	return func() tea.Msg {
+		path, _ := m.db.GetConfig(db.ConfigProjectsPath)
+		return projectsLoadedMsg{path: path}
+	}
+}
+
+func countProjects(projectsPath string) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := os.ReadDir(projectsPath)
+		if err != nil {
+			return projectsInfoMsg{count: 0}
+		}
+		count := 0
+		for _, e := range entries {
+			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+				count++
+			}
+		}
+		return projectsInfoMsg{count: count}
+	}
+}
+
 func tickEvery(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func clearStatusAfter(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return statusClearMsg{} })
+}
+
+func (m *Model) setStatus(msg string) tea.Cmd {
+	m.statusMsg = msg
+	return clearStatusAfter(5 * time.Second)
 }
 
 func (m Model) loadStories() tea.Cmd {
@@ -95,30 +173,91 @@ func (m Model) loadStories() tea.Cmd {
 // ── Update ────────────────────────────────────────────────────────────────────
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// ── Terminal output (regardless of active view) ───────────────────────
-	switch msg := msg.(type) {
-	case termOutputMsg:
-		if m.activeTerm != nil && msg.containerID == m.activeTerm.containerID {
-			m.activeTerm.feed(msg.data)
-			return m, m.activeTerm.listenCmd()
-		}
-		return m, nil
-
-	case termClosedMsg:
-		if m.activeTerm != nil && msg.containerID == m.activeTerm.containerID {
-			m.activeTerm.closed = true
+	// ── Vault picker overlay ──────────────────────────────────────────────
+	if m.vaultPicker != nil {
+		switch msg := msg.(type) {
+		case DirPickerDone:
+			m.vaultPath = msg.Path
+			m.vaultNoteCount = -1
+			m.vaultPicker = nil
+			cmds := []tea.Cmd{
+				func() tea.Msg {
+					_ = m.db.SetConfig(db.ConfigVaultPath, msg.Path)
+					return nil
+				},
+				countVaultNotes(msg.Path),
+			}
+			// After vault is set, prompt for projects folder if not yet configured.
+			if m.projectsPath == "" {
+				dp, cmd := newDirPickerWithTitle("Selecionar Pasta de Projetos", "", m.width, m.height)
+				m.projectsPicker = &dp
+				cmds = append(cmds, cmd)
+			}
+			return m, tea.Batch(cmds...)
+		case DirPickerCancelled:
+			m.vaultPicker = nil
+			// Vault skipped — still prompt for projects if not configured.
+			if m.projectsPath == "" {
+				dp, cmd := newDirPickerWithTitle("Selecionar Pasta de Projetos", "", m.width, m.height)
+				m.projectsPicker = &dp
+				return m, cmd
+			}
+			return m, nil
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.vaultPicker.width = msg.Width
+			m.vaultPicker.height = msg.Height
+		default:
+			pickerModel, cmd := m.vaultPicker.Update(msg)
+			p := pickerModel.(dirPicker)
+			m.vaultPicker = &p
+			return m, cmd
 		}
 		return m, nil
 	}
 
-	// ── Form overlay ──────────────────────────────────────────────────────
+	// ── Projects picker overlay ───────────────────────────────────────────
+	if m.projectsPicker != nil {
+		switch msg := msg.(type) {
+		case DirPickerDone:
+			m.projectsPath = msg.Path
+			m.projectsCount = -1
+			m.projectsPicker = nil
+			return m, tea.Batch(
+				func() tea.Msg {
+					_ = m.db.SetConfig(db.ConfigProjectsPath, msg.Path)
+					return nil
+				},
+				countProjects(msg.Path),
+			)
+		case DirPickerCancelled:
+			m.projectsPicker = nil
+			return m, nil
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.projectsPicker.width = msg.Width
+			m.projectsPicker.height = msg.Height
+		default:
+			pickerModel, cmd := m.projectsPicker.Update(msg)
+			p := pickerModel.(dirPicker)
+			m.projectsPicker = &p
+			return m, cmd
+		}
+		return m, nil
+	}
+
+	// ── Form overlay (forms + file picker) ───────────────────────────────
 	if m.activeForm != nil {
 		switch msg := msg.(type) {
-		case FormCancelled:
+		case FormCancelled, FilePickerCancelled:
 			m.activeForm = nil
 			return m, nil
 		case FormDone:
 			return m.handleFormDone(msg)
+		case FilePickerDone:
+			return m.handleFilePickerDone(msg)
 		case tea.WindowSizeMsg:
 			m.width = msg.Width
 			m.height = msg.Height
@@ -139,9 +278,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		if m.activeTerm != nil {
-			m.activeTerm.resize(m.termPaneWidth(), m.termPaneHeight())
-		}
 
 	case tickMsg:
 		return m, tea.Batch(m.loadStories(), tickEvery(3*time.Second))
@@ -151,18 +287,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rebuildCols()
 		m.clampCursor()
 
+	case termDetachedMsg:
+		return m, m.loadStories()
+
+	case vaultLoadedMsg:
+		m.vaultPath = msg.path
+		if msg.path == "" {
+			dp, cmd := newDirPickerWithTitle("Selecionar Vault Obsidian", "", m.width, m.height)
+			m.vaultPicker = &dp
+			return m, cmd
+		}
+		return m, countVaultNotes(msg.path)
+
+	case vaultInfoMsg:
+		m.vaultNoteCount = msg.noteCount
+
+	case projectsLoadedMsg:
+		m.projectsPath = msg.path
+		if msg.path == "" {
+			// Only auto-open projects picker if the vault picker isn't already shown.
+			if m.vaultPicker == nil {
+				dp, cmd := newDirPickerWithTitle("Selecionar Pasta de Projetos", "", m.width, m.height)
+				m.projectsPicker = &dp
+				return m, cmd
+			}
+		} else {
+			return m, countProjects(msg.path)
+		}
+
+	case projectsInfoMsg:
+		m.projectsCount = msg.count
+
 	case errMsg:
-		_ = msg.err
+		log.Printf("error: %v", msg.err)
+		return m, m.setStatus("erro: " + msg.err.Error())
+
+	case statusClearMsg:
+		m.statusMsg = ""
 
 	case tea.KeyMsg:
-		// Ctrl+Q always switches from terminal view back to the board.
-		if m.view == viewTerminal && msg.Type == tea.KeyCtrlQ {
-			m.view = viewBoard
-			return m, nil
-		}
-		if m.view == viewTerminal {
-			return m.handleTerminalKey(msg)
-		}
 		return m.handleKey(msg)
 	}
 
@@ -170,17 +333,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) rebuildCols() {
-	m.cols = [4][]*db.Story{}
+	m.cols = [5][]*db.Story{}
 	for _, s := range m.stories {
 		switch s.KanbanStatus {
 		case "todo":
-			m.cols[0] = append(m.cols[0], s)
+			m.cols[colTodo] = append(m.cols[colTodo], s)
+		case "refine":
+			m.cols[colRefine] = append(m.cols[colRefine], s)
 		case "doing":
-			m.cols[1] = append(m.cols[1], s)
+			m.cols[colDoing] = append(m.cols[colDoing], s)
 		case "review":
-			m.cols[2] = append(m.cols[2], s)
+			m.cols[colReview] = append(m.cols[colReview], s)
 		case "done":
-			m.cols[3] = append(m.cols[3], s)
+			m.cols[colDone] = append(m.cols[colDone], s)
 		}
 	}
 }
@@ -208,10 +373,17 @@ func (m *Model) selectedStory() *db.Story {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.Quit):
-		if m.activeTerm != nil {
-			m.activeTerm.close()
-		}
 		return m, tea.Quit
+
+	case key.Matches(msg, keys.SetVault):
+		dp, cmd := newDirPickerWithTitle("Selecionar Vault Obsidian", m.vaultPath, m.width, m.height)
+		m.vaultPicker = &dp
+		return m, cmd
+
+	case key.Matches(msg, keys.SetProjects):
+		dp, cmd := newDirPickerWithTitle("Selecionar Pasta de Projetos", m.projectsPath, m.width, m.height)
+		m.projectsPicker = &dp
+		return m, cmd
 
 	case key.Matches(msg, keys.Help):
 		m.showHelp = !m.showHelp
@@ -228,7 +400,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Right):
 		m.expanded = false
-		if m.col < 3 {
+		if m.col < colDone {
 			m.col++
 			m.clampCursor()
 		}
@@ -248,48 +420,67 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.expanded = !m.expanded
 
 	case key.Matches(msg, keys.New):
+		if m.vaultPath != "" {
+			fp, cmd := newFilePicker(m.vaultPath, m.width, m.height)
+			m.activeForm = fp
+			m.formKind = "file-picker"
+			return m, cmd
+		}
 		f := newNewStoryForm(m.width, m.height)
 		m.activeForm = f
 		m.formKind = "new-story"
 		return m, f.Init()
 
-	case key.Matches(msg, keys.Start):
+	case key.Matches(msg, keys.Refine):
 		s := m.selectedStory()
-		if s == nil || m.col != 0 {
+		if s == nil || m.col != colTodo {
 			break
 		}
-		f := newStartAgentForm(s.ID, s.Title, m.width, m.height)
+		prd := m.computePRDPath(s.ID, s.Title)
+		f := newStartRefineForm(s.ID, s.Title, prd, m.width, m.height)
 		m.activeForm = f
-		m.formKind = "start-agent"
+		m.formKind = "start-refine"
 		return m, f.Init()
+
+	case key.Matches(msg, keys.Start):
+		s := m.selectedStory()
+		if s == nil {
+			break
+		}
+		if m.col == colTodo || m.col == colRefine {
+			f := newStartAgentForm(s.ID, s.Title, m.width, m.height)
+			m.activeForm = f
+			m.formKind = "start-agent"
+			return m, f.Init()
+		}
 
 	case key.Matches(msg, keys.Approve):
 		s := m.selectedStory()
-		if s != nil && m.col == 2 {
+		if s != nil && m.col == colReview {
 			return m, m.moveStory(s, "done")
 		}
 
 	case key.Matches(msg, keys.Fix):
 		s := m.selectedStory()
-		if s != nil && m.col == 2 {
+		if s != nil && m.col == colReview {
 			return m, m.moveStory(s, "doing")
 		}
 
 	case key.Matches(msg, keys.Reopen):
 		s := m.selectedStory()
-		if s != nil && (m.col == 2 || m.col == 3) {
+		if s != nil && (m.col == colReview || m.col == colDone) {
 			return m, m.moveStory(s, "todo")
 		}
 
 	case key.Matches(msg, keys.Stop):
 		s := m.selectedStory()
-		if s != nil && m.col == 1 {
+		if s != nil && (m.col == colDoing || m.col == colRefine) {
 			return m, m.stopStory(s)
 		}
 
 	case key.Matches(msg, keys.Delete):
 		s := m.selectedStory()
-		if s != nil && (m.col == 0 || m.col == 3) {
+		if s != nil && (m.col == colTodo || m.col == colDone) {
 			return m, m.deleteStory(s)
 		}
 
@@ -304,39 +495,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── Terminal key handler ──────────────────────────────────────────────────────
-
-func (m Model) handleTerminalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.activeTerm == nil {
-		m.view = viewBoard
-		return m, nil
-	}
-
-	// Scroll controls (do NOT forward to container).
-	switch msg.Type {
-	case tea.KeyPgUp:
-		m.activeTerm.scrollOffset += m.termPaneHeight() / 2
-		return m, nil
-	case tea.KeyPgDown:
-		if m.activeTerm.scrollOffset > 0 {
-			m.activeTerm.scrollOffset -= m.termPaneHeight() / 2
-			if m.activeTerm.scrollOffset < 0 {
-				m.activeTerm.scrollOffset = 0
-			}
-		}
-		return m, nil
-	}
-
-	// All other keys go straight to the container.
-	if raw := keyToBytes(msg); len(raw) > 0 {
-		m.activeTerm.sendInput(raw)
-		// Auto-scroll to bottom when user types.
-		m.activeTerm.scrollOffset = 0
-	}
-	return m, nil
-}
-
 // ── Actions ───────────────────────────────────────────────────────────────────
+
+func (m Model) handleFilePickerDone(msg FilePickerDone) (tea.Model, tea.Cmd) {
+	m.activeForm = nil
+	return m, func() tea.Msg {
+		s := &db.Story{
+			ID:           uuid.New().String(),
+			Title:        msg.Title,
+			Description:  msg.Content,
+			KanbanStatus: "todo",
+		}
+		if err := m.db.InsertStory(s); err != nil {
+			return errMsg{err}
+		}
+		stories, _ := m.db.ListStories()
+		return storiesLoadedMsg(stories)
+	}
+}
 
 func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 	m.activeForm = nil
@@ -357,7 +533,9 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			return storiesLoadedMsg(stories)
 		}
 
-	case "start-agent":
+	case "start-refine":
+		vaultPath := m.vaultPath
+		projectsPath := m.projectsPath
 		return m, func() tea.Msg {
 			storyID := msg.Fields["story_id"]
 			story, err := m.db.GetStory(storyID)
@@ -365,10 +543,81 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 				return errMsg{err}
 			}
 
-			prompt := story.Title
-			if story.Description != "" {
-				prompt += "\n\n" + story.Description
+			hostPRD := msg.Fields["prd_path"]
+			if hostPRD != "" {
+				_ = os.MkdirAll(filepath.Dir(hostPRD), 0755)
+				_ = m.db.UpdateStoryPRD(storyID, hostPRD)
 			}
+
+			// Compute the PRD path as seen from inside the container.
+			containerPRD := ""
+			if vaultPath != "" && hostPRD != "" {
+				if rel := strings.TrimPrefix(hostPRD, vaultPath); rel != hostPRD {
+					containerPRD = "/vault" + rel
+				}
+			}
+
+			prompt := buildRefinementPrompt(story.Title, story.Description, containerPRD, vaultPath != "", projectsPath != "")
+			agentCmd := msg.Fields["agent_command"] + " " + shellQuote(prompt)
+
+			var envExtra []string
+			for _, line := range strings.Split(msg.Fields["env_extra"], "\n") {
+				line = strings.TrimSpace(line)
+				if strings.Contains(line, "=") {
+					envExtra = append(envExtra, line)
+				}
+			}
+			if containerPRD != "" {
+				envExtra = append(envExtra, "PRD_PATH="+containerPRD)
+			}
+			envExtra = append(envExtra, "QUINOA_MODE=refine")
+
+			taskID := uuid.New().String()
+			task, err := m.runner.StartTask(docker.RunConfig{
+				TaskID:       taskID,
+				AgentCommand: agentCmd,
+				EnvExtra:     envExtra,
+				VaultPath:    vaultPath,
+				ProjectsPath: projectsPath,
+			})
+			if err != nil {
+				return errMsg{err}
+			}
+
+			if err := m.db.UpdateStoryKanban(storyID, "refine", task.ID); err != nil {
+				return errMsg{err}
+			}
+
+			stories, _ := m.db.ListStories()
+			return storiesLoadedMsg(stories)
+		}
+
+	case "start-agent":
+		vaultPath := m.vaultPath
+		projectsPath := m.projectsPath
+		return m, func() tea.Msg {
+			storyID := msg.Fields["story_id"]
+			story, err := m.db.GetStory(storyID)
+			if err != nil {
+				return errMsg{err}
+			}
+
+			// If coming from refine, stop the refinement task first.
+			if story.KanbanStatus == "refine" && story.TaskID != "" {
+				if task, err := m.db.GetTask(story.TaskID); err == nil {
+					m.runner.StopTask(task)
+				}
+			}
+
+			// Compute PRD path inside the container (empty if vault not set).
+			containerPRD := ""
+			if vaultPath != "" && story.PrdPath != "" {
+				if rel := strings.TrimPrefix(story.PrdPath, vaultPath); rel != story.PrdPath {
+					containerPRD = "/vault" + rel
+				}
+			}
+
+			prompt := buildAgentPrompt(story.Title, story.Description, containerPRD, projectsPath != "")
 			agentCmd := msg.Fields["agent_command"] + " " + shellQuote(prompt)
 
 			var envExtra []string
@@ -382,11 +631,10 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			taskID := uuid.New().String()
 			task, err := m.runner.StartTask(docker.RunConfig{
 				TaskID:       taskID,
-				RepoURL:      msg.Fields["repo_url"],
-				RepoPath:     msg.Fields["repo_path"],
-				RepoBranch:   msg.Fields["repo_branch"],
 				AgentCommand: agentCmd,
 				EnvExtra:     envExtra,
+				VaultPath:    vaultPath,
+				ProjectsPath: projectsPath,
 			})
 			if err != nil {
 				return errMsg{err}
@@ -404,36 +652,38 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// computePRDPath returns the host filesystem path for a story's PRD.
+func (m Model) computePRDPath(storyID, storyTitle string) string {
+	base := m.vaultPath
+	if base == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".quinoa")
+	}
+	return filepath.Join(base, "PRDs", slugifyTitle(storyTitle)+".md")
+}
+
+// containerPRDPath converts a host PRD path to its path inside the container.
+// The vault is mounted at /vault in the container.
+func (m Model) containerPRDPath(hostPRD string) string {
+	if hostPRD == "" || m.vaultPath == "" {
+		return ""
+	}
+	rel := strings.TrimPrefix(hostPRD, m.vaultPath)
+	return "/vault" + rel
+}
+
 func (m Model) openTerminal(s *db.Story) (tea.Model, tea.Cmd) {
 	task, err := m.db.GetTask(s.TaskID)
 	if err != nil || task.ContainerID == "" {
 		return m, nil
 	}
-
-	// Close any previously open pane before opening a new one.
-	if m.activeTerm != nil && m.activeTerm.containerID != task.ContainerID {
-		m.activeTerm.close()
-		m.activeTerm = nil
-	}
-
-	// If already attached to the same container, just switch view.
-	if m.activeTerm != nil && m.activeTerm.containerID == task.ContainerID {
-		m.view = viewTerminal
-		m.activeTerm.scrollOffset = 0
-		return m, nil
-	}
-
-	pane, listenCmd, err := newTerminalPane(
-		s.Title, task.ContainerID, m.runner.Docker(),
-		m.termPaneWidth(), m.termPaneHeight(),
+	cmd := exec.Command("docker", "attach",
+		"--detach-keys=ctrl-q",
+		task.ContainerID,
 	)
-	if err != nil {
-		return m, nil
-	}
-
-	m.activeTerm = pane
-	m.view = viewTerminal
-	return m, listenCmd
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return termDetachedMsg{}
+	})
 }
 
 func (m Model) moveStory(s *db.Story, to string) tea.Cmd {
@@ -482,14 +732,17 @@ func (m Model) deleteStory(s *db.Story) tea.Cmd {
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m Model) View() string {
+	if m.vaultPicker != nil {
+		return m.vaultPicker.View()
+	}
+	if m.projectsPicker != nil {
+		return m.projectsPicker.View()
+	}
 	if m.activeForm != nil {
 		return m.activeForm.View()
 	}
 	if m.showHelp {
 		return m.helpView()
-	}
-	if m.view == viewTerminal && m.activeTerm != nil {
-		return m.terminalView()
 	}
 	return m.boardView()
 }
@@ -501,125 +754,145 @@ func (m Model) boardView() string {
 		return "carregando..."
 	}
 
-	header := m.renderHeader(false, "")
+	header := m.renderHeader()
 	hint := m.renderHint()
 	hintH := lipgloss.Height(hint)
 	headerH := lipgloss.Height(header)
 
-	boardH := m.height - headerH - hintH - 1
+	var statusBar string
+	statusBarH := 0
+	if m.statusMsg != "" {
+		statusBar = m.renderStatusBar()
+		statusBarH = lipgloss.Height(statusBar)
+	}
+
+	vaultBar := m.renderVaultBar()
+	vaultBarH := 0
+	if vaultBar != "" {
+		vaultBarH = lipgloss.Height(vaultBar)
+	}
+
+	projectsBar := m.renderProjectsBar()
+	projectsBarH := 0
+	if projectsBar != "" {
+		projectsBarH = lipgloss.Height(projectsBar)
+	}
+
+	boardH := m.height - headerH - hintH - statusBarH - vaultBarH - projectsBarH - 1
 	if boardH < 5 {
 		boardH = 5
 	}
 
 	board := m.renderBoard(m.width, boardH)
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, board, hint)
+	parts := []string{header}
+	if statusBarH > 0 {
+		parts = append(parts, statusBar)
+	}
+	if vaultBarH > 0 {
+		parts = append(parts, vaultBar)
+	}
+	if projectsBarH > 0 {
+		parts = append(parts, projectsBar)
+	}
+	parts = append(parts, board, hint)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-// ── Terminal view ─────────────────────────────────────────────────────────────
+// ── Status bars ───────────────────────────────────────────────────────────────
 
-// Chrome row counts.
-const termHeaderRows = 1
-const termFooterRows = 1
-
-func (m Model) termPaneHeight() int {
-	h := m.height - termHeaderRows - termFooterRows - 2 // borders
-	if h < 1 {
-		h = 1
-	}
-	return h
+func (m Model) renderStatusBar() string {
+	msg := truncate(m.statusMsg, m.width-4)
+	return " " + styleStatusError.Render("✗ "+msg)
 }
 
-func (m Model) termPaneWidth() int {
-	w := m.width - 2 // borders
-	if w < 1 {
-		w = 1
-	}
-	return w
-}
-
-func (m Model) terminalView() string {
-	p := m.activeTerm
-	header := m.renderHeader(true, p.storyTitle)
-	footer := m.renderTermFooter()
-
-	paneH := m.termPaneHeight()
-	paneW := m.termPaneWidth()
-
-	lines := p.visibleLines(paneH)
-
-	// Build content: pad to pane height so the border fills correctly.
-	var sb strings.Builder
-	for i := 0; i < paneH; i++ {
-		if i < len(lines) {
-			sb.WriteString(renderTermLine(lines[i], paneW))
-		}
-		if i < paneH-1 {
-			sb.WriteByte('\n')
-		}
+func (m Model) renderVaultBar() string {
+	if m.vaultPath == "" {
+		return ""
 	}
 
-	borderColor := colorBorder
-	if p.closed {
-		borderColor = colorMuted
-	}
+	vaultName := filepath.Base(m.vaultPath)
+	nameStyle := lipgloss.NewStyle().Foreground(colorPurple).Bold(true)
+	name := nameStyle.Render("⌁ " + vaultName)
 
-	pane := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Width(paneW).
-		Height(paneH).
-		Render(sb.String())
+	sep := styleHint.Render("  ·  ")
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, pane, footer)
-}
-
-func (m Model) renderTermFooter() string {
-	p := m.activeTerm
-
-	status := ""
-	if p.closed {
-		status = styleStatusStopped.Render("● encerrado")
+	_, statErr := os.Stat(m.vaultPath)
+	var status string
+	if statErr != nil {
+		status = styleStatusError.Render("✗ pasta não encontrada")
 	} else {
-		status = styleStatusRunning.Render("● ativo")
+		_, obsErr := os.Stat(filepath.Join(m.vaultPath, ".obsidian"))
+		vaultType := "pasta"
+		if obsErr == nil {
+			vaultType = "obsidian"
+		}
+
+		noteStr := ""
+		if m.vaultNoteCount >= 0 {
+			noteStr = sep + styleHint.Render(fmt.Sprintf("%d notas", m.vaultNoteCount))
+		}
+		status = styleStatusRunning.Render("✓") +
+			styleHint.Render(" "+vaultType) +
+			noteStr
 	}
 
-	scrollHint := ""
-	if p.scrollOffset > 0 {
-		scrollHint = styleHint.Render(fmt.Sprintf("  ↑%d linhas", p.scrollOffset))
+	pathHint := styleCardDesc.Render(truncate(m.vaultPath, m.width/2-20))
+
+	return " " + name + sep + pathHint + sep + status
+}
+
+func (m Model) renderProjectsBar() string {
+	if m.projectsPath == "" {
+		return ""
 	}
 
-	hint := styleHintKey.Render("ctrl+q") + styleHint.Render(" voltar ao board") +
-		styleHint.Render("  pgup/pgdn") + styleHint.Render(" rolar") +
-		scrollHint
+	nameStyle := lipgloss.NewStyle().Foreground(colorCyan).Bold(true)
+	name := nameStyle.Render("⌂ " + filepath.Base(m.projectsPath))
+	sep := styleHint.Render("  ·  ")
 
-	gap := m.width - lipgloss.Width(status) - lipgloss.Width(hint) - 2
-	if gap < 1 {
-		gap = 1
+	_, statErr := os.Stat(m.projectsPath)
+	var status string
+	if statErr != nil {
+		status = styleStatusError.Render("✗ pasta não encontrada")
+	} else {
+		countStr := ""
+		if m.projectsCount >= 0 {
+			countStr = sep + styleHint.Render(fmt.Sprintf("%d projetos", m.projectsCount))
+		}
+		status = styleStatusRunning.Render("✓") + styleHint.Render(" projetos") + countStr
 	}
 
-	return " " + status + strings.Repeat(" ", gap) + hint
+	pathHint := styleCardDesc.Render(truncate(m.projectsPath, m.width/2-20))
+
+	return " " + name + sep + pathHint + sep + status
 }
 
 // ── Shared header ─────────────────────────────────────────────────────────────
 
-func (m Model) renderHeader(termMode bool, storyTitle string) string {
+func (m Model) renderHeader() string {
 	title := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("quinoa")
 	sep := lipgloss.NewStyle().Foreground(colorBorder).Render(" · ")
+	nav := lipgloss.NewStyle().Foreground(colorMuted).Render("board")
 
-	var nav string
-	if termMode {
-		nav = lipgloss.NewStyle().Foreground(colorMuted).Render("board") +
-			sep +
-			lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("terminal") +
-			styleHint.Render("  "+truncate(storyTitle, 40))
+	var vaultChip string
+	if m.vaultPath != "" {
+		vaultChip = sep + lipgloss.NewStyle().Foreground(colorBg3).Render("⌁ "+filepath.Base(m.vaultPath))
 	} else {
-		nav = lipgloss.NewStyle().Foreground(colorMuted).Render("board")
+		vaultChip = sep + styleStatusStopped.Render("sem vault  ") +
+			styleHintKey.Render("V") + styleHint.Render(" configurar")
+	}
+
+	var projectsChip string
+	if m.projectsPath != "" {
+		projectsChip = sep + lipgloss.NewStyle().Foreground(colorBg3).Render("⌂ "+filepath.Base(m.projectsPath))
+	} else {
+		projectsChip = sep + styleStatusStopped.Render("sem projetos  ") +
+			styleHintKey.Render("P") + styleHint.Render(" configurar")
 	}
 
 	right := lipgloss.NewStyle().Foreground(colorMuted).Render(time.Now().Format("15:04:05"))
-
-	middle := title + sep + nav
+	middle := title + sep + nav + vaultChip + projectsChip
 	gap := m.width - lipgloss.Width(middle) - lipgloss.Width(right) - 2
 	if gap < 1 {
 		gap = 1
@@ -642,9 +915,9 @@ func (m Model) renderHint() string {
 
 func (m Model) renderBoard(width, height int) string {
 	gap := 1
-	colW := (width - gap*3) / 4
+	colW := (width - gap*4) / 5
 
-	colNames := []string{"Todo", "Doing", "Review", "Done"}
+	colNames := []string{"Todo", "Refine", "Doing", "Review", "Done"}
 	var rendered []string
 
 	for i, name := range colNames {
@@ -659,6 +932,8 @@ func (m Model) renderBoard(width, height int) string {
 		rendered[2],
 		strings.Repeat(" ", gap),
 		rendered[3],
+		strings.Repeat(" ", gap),
+		rendered[4],
 	)
 }
 
@@ -666,9 +941,12 @@ func (m Model) renderColumn(colIdx int, name string, cards []*db.Story, focused 
 	count := fmt.Sprintf("(%d)", len(cards))
 
 	var headerStyle lipgloss.Style
-	if colIdx == 2 {
+	switch colIdx {
+	case colRefine:
+		headerStyle = styleColHeaderRefine
+	case colReview:
 		headerStyle = styleColHeaderReview
-	} else {
+	default:
 		headerStyle = styleColHeader
 	}
 	if focused {
@@ -729,13 +1007,10 @@ func (m Model) renderCard(s *db.Story, selected bool, colIdx int, width int) str
 		parts = append(parts, badge)
 	}
 
-	// Show indicator when this story's terminal is currently attached.
-	if m.activeTerm != nil && s.TaskID != "" {
-		task, err := m.db.GetTask(s.TaskID)
-		if err == nil && task.ContainerID == m.activeTerm.containerID {
-			indicator := styleStatusRunning.Render("⊞ terminal")
-			parts = append(parts, indicator)
-		}
+	// Show PRD indicator for refine cards that have a PRD path.
+	if colIdx == colRefine && s.PrdPath != "" {
+		prdLabel := "⌁ " + filepath.Base(s.PrdPath)
+		parts = append(parts, lipgloss.NewStyle().Foreground(colorPurple).Render(prdLabel))
 	}
 
 	content := strings.Join(parts, "\n")
@@ -750,12 +1025,13 @@ func (m Model) renderCard(s *db.Story, selected bool, colIdx int, width int) str
 func (m Model) helpView() string {
 	sections := []struct{ title, body string }{
 		{"Navegação (board)", "h/← l/→     mover entre colunas\nk/↑ j/↓     mover entre cards\nenter        expandir descrição"},
-		{"Ações Globais", "n            nova história\nr            refresh manual\n?            fechar ajuda\nq            sair"},
-		{"Todo", "s            iniciar agente\nx            deletar história"},
-		{"Doing", "p            parar agente → todo\nt            abrir terminal"},
-		{"Review", "a            aprovar → done\nf            corrigir → doing\nb            reabrir → todo\nt            abrir terminal"},
-		{"Done", "b            reabrir → todo\nx            deletar história\nt            abrir terminal"},
-		{"Terminal", "ctrl+q       voltar ao board\npgup/pgdn    rolar saída\n(todo o resto é enviado ao container)"},
+		{"Ações Globais", "n            nova história\nr            refresh manual\nV            selecionar vault Obsidian\nP            selecionar pasta de projetos\n?            fechar ajuda\nq            sair"},
+		{"Todo", "R            refinar → refine\ns            iniciar direto → doing\nx            deletar história"},
+		{"Refine", "t            attach terminal (agente interativo)\ns            iniciar implementação → doing\np            parar agente → todo\nb            voltar → todo"},
+		{"Doing", "p            parar agente → todo\nt            attach terminal (docker attach)"},
+		{"Review", "a            aprovar → done\nf            corrigir → doing\nb            reabrir → todo\nt            attach terminal (docker attach)"},
+		{"Done", "b            reabrir → todo\nx            deletar história\nt            attach terminal (docker attach)"},
+		{"Terminal (attach)", "ctrl-q       desconectar e voltar ao board\n(tudo mais é enviado ao container)"},
 		{"Formulários", "tab/shift+tab campo anterior/próximo\nctrl+s       confirmar\nesc          cancelar"},
 	}
 
@@ -830,4 +1106,134 @@ func wrapText(s string, width, maxLines int) string {
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// buildPRDTemplate returns an empty PRD skeleton with the story title and today's date.
+func buildPRDTemplate(title string) string {
+	date := time.Now().Format("2006-01-02")
+	return "# PRD: " + title + "\n\n" +
+		"**Status:** Draft\n" +
+		"**Criado em:** " + date + "\n\n" +
+		"---\n\n" +
+		"## Contexto e Problema\n\n" +
+		"[Descreva o contexto e o problema que esta história resolve]\n\n" +
+		"## Objetivos\n\n" +
+		"[Liste os objetivos mensuráveis desta história]\n\n" +
+		"## Histórias de Usuário\n\n" +
+		"[Histórias no formato: Como [perfil], quero [ação] para que [benefício]]\n\n" +
+		"## Critérios de Aceitação\n\n" +
+		"- [ ] [critério 1]\n" +
+		"- [ ] [critério 2]\n\n" +
+		"## Requisitos Técnicos\n\n" +
+		"[Detalhes técnicos, APIs, modelos de dados, decisões de arquitetura, restrições]\n\n" +
+		"## Fora do Escopo\n\n" +
+		"[O que NÃO será implementado nesta história]\n\n" +
+		"## Notas para o Agente de Desenvolvimento\n\n" +
+		"[Orientações específicas, preferências de implementação, contexto adicional]\n\n" +
+		"## Resumo do Refinamento\n\n" +
+		"[Síntese da conversa, principais decisões e o raciocínio por trás delas]"
+}
+
+// buildAgentPrompt returns the prompt for a development agent.
+// containerPRDPath is the PRD path inside the container (empty if no vault/PRD).
+// hasProjects indicates whether /projects is mounted with the user's code.
+func buildAgentPrompt(storyTitle, storyDesc, containerPRDPath string, hasProjects bool) string {
+	prompt := storyTitle
+	if storyDesc != "" {
+		prompt += "\n\n" + storyDesc
+	}
+	if containerPRDPath != "" {
+		prompt += "\n\nLeia o PRD em " + containerPRDPath + ".\n" +
+			"Ele especifica os requisitos detalhados e indica qual projeto deve ser modificado."
+	}
+	if hasProjects {
+		prompt += "\n\nOs projetos de código estão disponíveis em /projects. " +
+			"Identifique o projeto correto (a partir do PRD ou do contexto da história) e navegue até ele para implementar as alterações."
+	}
+	return prompt
+}
+
+// buildRefinementPrompt returns the full system prompt for a refinement agent.
+// containerPRDPath is the absolute path inside the container where the PRD must be written;
+// if empty (no vault mounted), the agent is instructed to print the PRD to stdout instead.
+// hasVault indicates whether the Obsidian vault is mounted at /vault.
+// hasProjects indicates whether the local projects folder is mounted at /projects.
+func buildRefinementPrompt(storyTitle, storyDesc, containerPRDPath string, hasVault, hasProjects bool) string {
+	var descBlock string
+	if storyDesc != "" {
+		descBlock = "\n\nContexto fornecido:\n" + storyDesc
+	}
+
+	var saveStep string
+	if containerPRDPath != "" {
+		saveStep = "Salve o PRD no arquivo abaixo, certificando-se de que todas as seções estão preenchidas:\n" +
+			containerPRDPath + "\n\n" +
+			"Após salvar o arquivo com sucesso, execute:\n" +
+			`echo "[QUINOA:DONE]"`
+	} else {
+		saveStep = "Imprima o PRD completo no terminal e depois execute:\n" +
+			`echo "[QUINOA:DONE]"`
+	}
+
+	// Describe the context sources available inside the container.
+	var sources []string
+	if hasVault {
+		sources = append(sources, "• **Vault Obsidian** em /vault — notas, documentação e decisões anteriores do projeto")
+	}
+	if hasProjects {
+		sources = append(sources, "• **Projetos de código** em /projects — implementação atual, APIs, modelos de dados")
+	}
+
+	var contextSources string
+	switch len(sources) {
+	case 0:
+		contextSources = "Nenhum contexto adicional está disponível nesta sessão.\n"
+	case 1:
+		contextSources = "Você tem acesso ao seguinte contexto:\n" + sources[0] + "\n\n" +
+			"Antes de fazer qualquer pergunta ao usuário, consulte esse contexto.\n" +
+			"Use read_file, search, grep e ferramentas similares para explorar.\n"
+	default:
+		contextSources = "Você tem acesso aos seguintes contextos:\n" +
+			strings.Join(sources, "\n") + "\n\n" +
+			"Antes de fazer qualquer pergunta ao usuário, consulte esses contextos.\n" +
+			"Use read_file, search, grep e ferramentas similares para encontrar a resposta.\n"
+	}
+
+	tpl := buildPRDTemplate(storyTitle)
+
+	return "Você é um product manager especialista em refinamento de histórias de software.\n\n" +
+		"**História para refinar:** " + storyTitle + descBlock + "\n\n" +
+		"## Contexto disponível\n\n" +
+		contextSources + "\n" +
+		"## Regra principal: contexto antes de perguntar\n\n" +
+		"Só faça uma pergunta ao usuário se:\n" +
+		"• O contexto disponível não deixar claro qual é a decisão correta, ou\n" +
+		"• For necessária uma escolha de produto/negócio que o contexto não pode responder.\n" +
+		"Quando encontrar a resposta no contexto disponível, mencione brevemente o que encontrou antes de prosseguir.\n\n" +
+		"## Sessão de refinamento\n\n" +
+		"Conduza uma sessão interativa explorando os seguintes pontos.\n" +
+		"Para cada ponto, consulte o contexto disponível primeiro e só pergunte o que restar:\n" +
+		"• O contexto e o problema que a história resolve\n" +
+		"• Os objetivos e critérios de sucesso mensuráveis\n" +
+		"• Os requisitos técnicos, restrições e decisões de arquitetura\n" +
+		"• O que está dentro e fora do escopo\n" +
+		"• Riscos, dependências e alternativas consideradas\n\n" +
+		"Quando o usuário indicar que o refinamento está concluído, siga estes dois passos:\n\n" +
+		"**Passo 1 — Escreva o PRD** usando EXATAMENTE a estrutura abaixo.\n" +
+		"Substitua cada colchete pelo conteúdo real baseado na conversa e no contexto levantado:\n\n" +
+		tpl + "\n\n" +
+		"**Passo 2 — " + saveStep + "\n\n" +
+		"Comece a sessão explorando o contexto disponível, depois apresente-se e inicie o refinamento."
+}
+
+var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
+
+func slugifyTitle(s string) string {
+	s = strings.ToLower(s)
+	s = slugRe.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		s = "prd"
+	}
+	return s
 }
