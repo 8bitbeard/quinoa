@@ -254,6 +254,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if s != nil && (m.col == 0 || m.col == 3) {
 			return m, m.deleteStory(s)
 		}
+
+	case key.Matches(msg, keys.Terminal):
+		s := m.selectedStory()
+		if s == nil || s.TaskID == "" {
+			break
+		}
+		return m, m.openTerminal(s)
 	}
 
 	return m, nil
@@ -368,6 +375,19 @@ func (m Model) deleteStory(s *db.Story) tea.Cmd {
 	}
 }
 
+func (m Model) openTerminal(s *db.Story) tea.Cmd {
+	task, err := m.db.GetTask(s.TaskID)
+	if err != nil || task.ContainerID == "" {
+		return nil
+	}
+	cmd := newAttachExec(task.ContainerID, m.runner.Docker())
+	return tea.Exec(cmd, func(err error) tea.Msg {
+		// After detach, reload board to reflect any status changes.
+		stories, _ := m.db.ListStories()
+		return storiesLoadedMsg(stories)
+	})
+}
+
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m Model) View() string {
@@ -432,7 +452,13 @@ func (m Model) renderHeader() string {
 
 func (m Model) renderHint() string {
 	colStatus := columns[m.col]
-	return " " + helpText(colStatus)
+	hasContainer := false
+	if s := m.selectedStory(); s != nil && s.TaskID != "" {
+		if task, err := m.db.GetTask(s.TaskID); err == nil && task.ContainerID != "" {
+			hasContainer = true
+		}
+	}
+	return " " + helpText(colStatus, hasContainer)
 }
 
 func (m Model) renderBoard(width, height int) string {

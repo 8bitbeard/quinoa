@@ -3,25 +3,26 @@ package tui
 import "github.com/charmbracelet/bubbles/key"
 
 type keyMap struct {
-	Left    key.Binding
-	Right   key.Binding
-	Up      key.Binding
-	Down    key.Binding
-	New     key.Binding
-	Start   key.Binding
-	Approve key.Binding
-	Fix     key.Binding
-	Reopen  key.Binding
-	Stop    key.Binding
-	Delete  key.Binding
-	Expand  key.Binding
-	Refresh key.Binding
-	Help    key.Binding
-	Quit    key.Binding
-	Confirm key.Binding
-	Cancel  key.Binding
-	Tab     key.Binding
-	ShiftTab key.Binding
+	Left      key.Binding
+	Right     key.Binding
+	Up        key.Binding
+	Down      key.Binding
+	New       key.Binding
+	Start     key.Binding
+	Approve   key.Binding
+	Fix       key.Binding
+	Reopen    key.Binding
+	Stop      key.Binding
+	Delete    key.Binding
+	Expand    key.Binding
+	Terminal  key.Binding
+	Refresh   key.Binding
+	Help      key.Binding
+	Quit      key.Binding
+	Confirm   key.Binding
+	Cancel    key.Binding
+	Tab       key.Binding
+	ShiftTab  key.Binding
 	NextField key.Binding
 	PrevField key.Binding
 }
@@ -75,6 +76,10 @@ var keys = keyMap{
 		key.WithKeys("enter"),
 		key.WithHelp("enter", "expandir"),
 	),
+	Terminal: key.NewBinding(
+		key.WithKeys("t"),
+		key.WithHelp("t", "abrir terminal"),
+	),
 	Refresh: key.NewBinding(
 		key.WithKeys("r"),
 		key.WithHelp("r", "refresh"),
@@ -111,11 +116,18 @@ var keys = keyMap{
 	),
 }
 
-func helpText(colStatus string) string {
+// helpText returns the bottom hint bar for the given column.
+// hasContainer indicates whether the focused card has a running container.
+func helpText(colStatus string, hasContainer bool) string {
 	base := styleHintKey.Render("n") + styleHint.Render(" nova  ") +
 		styleHintKey.Render("r") + styleHint.Render(" refresh  ") +
 		styleHintKey.Render("?") + styleHint.Render(" ajuda  ") +
 		styleHintKey.Render("q") + styleHint.Render(" sair")
+
+	termHint := ""
+	if hasContainer {
+		termHint = styleHintKey.Render("t") + styleHint.Render(" terminal  ")
+	}
 
 	switch colStatus {
 	case "todo":
@@ -123,15 +135,18 @@ func helpText(colStatus string) string {
 			styleHintKey.Render("x") + styleHint.Render(" deletar  ") +
 			base
 	case "doing":
-		return styleHintKey.Render("p") + styleHint.Render(" parar  ") +
+		return termHint +
+			styleHintKey.Render("p") + styleHint.Render(" parar  ") +
 			base
 	case "review":
-		return styleHintKey.Render("a") + styleHint.Render(" aprovar  ") +
+		return termHint +
+			styleHintKey.Render("a") + styleHint.Render(" aprovar  ") +
 			styleHintKey.Render("f") + styleHint.Render(" corrigir  ") +
 			styleHintKey.Render("b") + styleHint.Render(" reabrir  ") +
 			base
 	case "done":
-		return styleHintKey.Render("b") + styleHint.Render(" reabrir  ") +
+		return termHint +
+			styleHintKey.Render("b") + styleHint.Render(" reabrir  ") +
 			styleHintKey.Render("x") + styleHint.Render(" deletar  ") +
 			base
 	}

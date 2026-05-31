@@ -21,6 +21,8 @@ func NewRunner(database *db.DB, dockerClient *docker.Client) *Runner {
 	return &Runner{db: database, docker: dockerClient}
 }
 
+func (r *Runner) Docker() *docker.Client { return r.docker }
+
 // StartTask creates a task record and launches the container in the background.
 // Returns the created task (with ID) so the caller can link it to a story.
 func (r *Runner) StartTask(cfg docker.RunConfig) (*db.Task, error) {
