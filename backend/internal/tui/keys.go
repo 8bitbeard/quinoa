@@ -23,8 +23,9 @@ type keyMap struct {
 	Cancel    key.Binding
 	Tab       key.Binding
 	ShiftTab  key.Binding
-	NextField key.Binding
-	PrevField key.Binding
+	NextField  key.Binding
+	PrevField  key.Binding
+	OpenPicker key.Binding
 }
 
 var keys = keyMap{
@@ -113,6 +114,10 @@ var keys = keyMap{
 	),
 	PrevField: key.NewBinding(
 		key.WithKeys("shift+tab"),
+	),
+	OpenPicker: key.NewBinding(
+		key.WithKeys("ctrl+o"),
+		key.WithHelp("ctrl+o", "selecionar pasta"),
 	),
 }
 

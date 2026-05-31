@@ -139,6 +139,9 @@ type startAgentForm struct {
 	preset     int
 	width      int
 	height     int
+
+	// Folder picker overlay (nil = closed).
+	picker    *dirPicker
 }
 
 func newStartAgentForm(storyID, storyTitle string, width, height int) startAgentForm {
@@ -177,11 +180,42 @@ func newStartAgentForm(storyID, storyTitle string, width, height int) startAgent
 func (f startAgentForm) Init() tea.Cmd { return textinput.Blink }
 
 func (f startAgentForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// ── Dir picker overlay ────────────────────────────────────────────────
+	if f.picker != nil {
+		switch msg := msg.(type) {
+		case DirPickerDone:
+			f.fields[fieldRepoPath].SetValue(msg.Path)
+			f.picker = nil
+			// Refocus the repo path field so the user sees the result.
+			f.fields[f.focused].Blur()
+			f.focused = fieldRepoPath
+			f.fields[f.focused].Focus()
+			return f, textinput.Blink
+
+		case DirPickerCancelled:
+			f.picker = nil
+			return f, textinput.Blink
+
+		default:
+			pickerModel, cmd := f.picker.Update(msg)
+			p := pickerModel.(dirPicker)
+			f.picker = &p
+			return f, cmd
+		}
+	}
+
+	// ── Normal form update ────────────────────────────────────────────────
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, keys.Cancel):
 			return f, func() tea.Msg { return FormCancelled{} }
+
+		case key.Matches(msg, keys.OpenPicker):
+			// Open the folder picker starting from whatever is already typed.
+			dp, cmd := newDirPicker(f.fields[fieldRepoPath].Value(), f.width, f.height)
+			f.picker = &dp
+			return f, cmd
 
 		case key.Matches(msg, keys.Confirm):
 			agentCmd := strings.TrimSpace(f.fields[fieldAgentCmd].Value())
@@ -238,9 +272,14 @@ func (f startAgentForm) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (f startAgentForm) View() string {
+	// When the picker overlay is open, delegate entirely to it.
+	if f.picker != nil {
+		return f.picker.View()
+	}
+
 	labels := []string{
 		"URL do repositório (git clone)",
-		"Pasta local (bind-mount)",
+		"Pasta local  " + styleHintKey.Render("ctrl+o") + styleHint.Render(" seletor"),
 		"Branch (opcional)",
 		fmt.Sprintf("Agente  [ ] ciclar preset (%d/%d)", f.preset+1, len(agentPresets)),
 		"Env vars extras (KEY=VALUE, uma por linha)",
@@ -251,9 +290,10 @@ func (f startAgentForm) View() string {
 		rows = append(rows, label+"\n"+fi.View())
 	}
 
-	ref := styleHint.Render("▸ "+f.storyTitle)
+	ref := styleHint.Render("▸ " + f.storyTitle)
 
 	hint := styleHintKey.Render("tab") + styleHint.Render(" campo  ") +
+		styleHintKey.Render("ctrl+o") + styleHint.Render(" pasta  ") +
 		styleHintKey.Render("[/]") + styleHint.Render(" preset  ") +
 		styleHintKey.Render("ctrl+s") + styleHint.Render(" iniciar  ") +
 		styleHintKey.Render("esc") + styleHint.Render(" cancelar")
