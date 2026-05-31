@@ -1,21 +1,16 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"syscall"
-	"time"
 
-	"github.com/wiltsou/quinoa/internal/api"
-	"github.com/wiltsou/quinoa/internal/browser"
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/wiltsou/quinoa/internal/db"
 	"github.com/wiltsou/quinoa/internal/docker"
+	"github.com/wiltsou/quinoa/internal/tui"
 )
 
 func main() {
@@ -35,48 +30,14 @@ func main() {
 		log.Fatalf("docker: %v", err)
 	}
 
-	router := api.NewRouter(database, dockerClient)
+	runner := tui.NewRunner(database, dockerClient)
+	model := tui.NewModel(database, runner)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = freePort()
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "erro: %v\n", err)
+		os.Exit(1)
 	}
-	addr := "127.0.0.1:" + port
-
-	srv := &http.Server{Addr: addr, Handler: router}
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
-		}
-	}()
-
-	url := "http://" + addr
-	log.Printf("quinoa at %s", url)
-
-	if os.Getenv("QUINOA_HEADLESS") != "1" {
-		time.Sleep(150 * time.Millisecond)
-		if err := browser.Open(url); err != nil {
-			log.Printf("browser: %v — abra %s manualmente", err, url)
-		}
-	}
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Println("quinoa encerrando...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
-}
-
-func freePort() string {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "8080"
-	}
-	defer l.Close()
-	return fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port)
 }
 
 func dataDirectory() string {
