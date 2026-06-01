@@ -91,6 +91,11 @@ trust_path "$WORK_DIR"
 mkdir -p ".claude"
 printf '{"defaultMode":"bypassPermissions"}\n' > ".claude/settings.json"
 
+# Remove --dangerously-skip-permissions from the command: the flag triggers an
+# interactive confirmation dialog that cannot be auto-accepted. The settings.json
+# above already enables bypassPermissions mode, making the flag redundant.
+AGENT_COMMAND="${AGENT_COMMAND//--dangerously-skip-permissions/}"
+
 echo "[quinoa] setup concluído — iniciando agente..."
 echo ""
 
