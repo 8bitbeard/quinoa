@@ -86,8 +86,16 @@ trust_path "$WORK_DIR"
 [[ -d "/projects" ]] && trust_path "/projects"
 [[ -d "/vault" ]]    && trust_path "/vault"
 
-# Place a .claude/settings.json in the working directory so Claude Code enters
-# bypassPermissions mode without showing the "--dangerously-skip-permissions" confirmation.
+# Write bypassPermissions to the global Claude settings so the agent never
+# prompts for approval regardless of which directory it navigates to.
+# The local project settings.json is kept as a fallback for older CLI versions.
+mkdir -p "$HOME/.claude"
+if [ -f "$HOME/.claude/settings.json" ]; then
+    jq '. + {"defaultMode":"bypassPermissions"}' "$HOME/.claude/settings.json" \
+        > /tmp/.cs.tmp && mv /tmp/.cs.tmp "$HOME/.claude/settings.json" || true
+else
+    printf '{"defaultMode":"bypassPermissions"}\n' > "$HOME/.claude/settings.json"
+fi
 mkdir -p ".claude"
 printf '{"defaultMode":"bypassPermissions"}\n' > ".claude/settings.json"
 
