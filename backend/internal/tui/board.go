@@ -1317,12 +1317,19 @@ func buildTechLeadDoingPrompt(storyTitle, storyDesc, containerPRDPath string, ha
 		intro += "\n\n## Instruções\n\n" +
 			"1. Leia o PRD completo em " + containerPRDPath + "\n" +
 			"2. Identifique todas as tarefas técnicas necessárias (ex: endpoint de API, componente frontend, migration de banco, testes)\n" +
-			"3. Para cada tarefa independente, emita um sinal de spawn **antes de emitir [QUINOA:DONE]**:\n\n" +
+			"3. Para cada tarefa independente, emita um bloco de spawn **antes de emitir [QUINOA:DONE]**:\n\n" +
 			"   ```\n" +
-			"   echo \"[QUINOA:SPAWN:<instrução autocontida para o agente>]\"\n" +
+			"   echo \"[QUINOA:SPAWN]\"\n" +
+			"   echo \"<descrição completa e autocontida da tarefa>\"\n" +
+			"   echo \"[/QUINOA:SPAWN]\"\n" +
 			"   ```\n\n" +
 			"   A instrução deve conter: o que implementar, em qual projeto dentro de /projects, e que o PRD está em " + containerPRDPath + ".\n" +
-			"   Exemplo: `[QUINOA:SPAWN:Implemente o endpoint POST /api/users no projeto em /projects/backend. PRD em " + containerPRDPath + ". Adicione validação e testes unitários.]`\n\n" +
+			"   Exemplo:\n" +
+			"   ```\n" +
+			"   echo \"[QUINOA:SPAWN]\"\n" +
+			"   echo \"Implemente o endpoint POST /api/users no projeto em /projects/backend. PRD em " + containerPRDPath + ". Adicione validação e testes unitários.\"\n" +
+			"   echo \"[/QUINOA:SPAWN]\"\n" +
+			"   ```\n\n" +
 			"4. Após emitir todos os spawns, sinalize sua conclusão:\n" +
 			"   ```\n" +
 			"   echo \"[QUINOA:DONE]\"\n" +
@@ -1330,7 +1337,11 @@ func buildTechLeadDoingPrompt(storyTitle, storyDesc, containerPRDPath string, ha
 			"Se o PRD não indicar projetos separados ou todas as tarefas forem interdependentes, delegue tudo a um único agente via spawn."
 	} else {
 		intro += "\n\nNão há PRD disponível. Delegue a implementação completa da história a um agente via:\n" +
-			"   echo \"[QUINOA:SPAWN:<descrição completa da tarefa>]\"\n" +
+			"   ```\n" +
+			"   echo \"[QUINOA:SPAWN]\"\n" +
+			"   echo \"<descrição completa da tarefa>\"\n" +
+			"   echo \"[/QUINOA:SPAWN]\"\n" +
+			"   ```\n" +
 			"E depois: echo \"[QUINOA:DONE]\""
 	}
 
@@ -1473,10 +1484,19 @@ func buildTechLeadReviewPrompt(storyTitle, containerPRDPath string, hasProjects,
 		"4. **Se encontrar problemas no code review**:\n" +
 		"   - Adicione ao final do PRD uma seção \"## Feedback Code Review\" com os problemas encontrados\n" +
 		"   - Execute: `echo \"[QUINOA:RETURN_TO_DOING]\"`\n" +
-		"5. **Independentemente do resultado do code review**, spawne os agentes de QA e Segurança:\n" +
+		"5. **Independentemente do resultado do code review**, spawne os agentes de QA e Segurança executando EXATAMENTE estes comandos:\n" +
 		"   ```\n" +
-		"   echo \"[QUINOA:SPAWN:" + qaInstruction + "]\"\n" +
-		"   echo \"[QUINOA:SPAWN:" + secInstruction + "]\"\n" +
+		"   echo \"[QUINOA:SPAWN]\"\n" +
+		"   cat <<'QUINOA_END'\n" +
+		qaInstruction + "\n" +
+		"   QUINOA_END\n" +
+		"   echo \"[/QUINOA:SPAWN]\"\n" +
+		"\n" +
+		"   echo \"[QUINOA:SPAWN]\"\n" +
+		"   cat <<'QUINOA_END'\n" +
+		secInstruction + "\n" +
+		"   QUINOA_END\n" +
+		"   echo \"[/QUINOA:SPAWN]\"\n" +
 		"   ```\n" +
 		"6. Execute ao final: `echo \"[QUINOA:DONE]\"`"
 }

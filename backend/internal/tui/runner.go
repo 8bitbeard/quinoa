@@ -178,22 +178,68 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 	defer stream.Close()
 
 	scanner := bufio.NewScanner(stream)
+	// Increase buffer to handle long lines (agent output can be verbose).
+	scanner.Buffer(make([]byte, 512*1024), 512*1024)
+
+	var (
+		spawnBuf strings.Builder
+		inSpawn  bool // true while accumulating a multi-line [QUINOA:SPAWN]...[/QUINOA:SPAWN] block
+	)
+
 	for scanner.Scan() {
 		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
 
-		// [QUINOA:SPAWN:<instruction>] — create a parallel sub-agent for the same story.
-		if idx := strings.Index(line, "[QUINOA:SPAWN:"); idx != -1 {
-			end := strings.Index(line[idx:], "]")
-			if end > 0 {
-				instruction := strings.TrimSpace(line[idx+len("[QUINOA:SPAWN:") : idx+end])
+		// ── Multi-line SPAWN accumulation ──────────────────────────────────
+		// While inside a SPAWN block we must NOT process any other signals —
+		// instruction bodies often contain "[QUINOA:DONE]" text that would
+		// otherwise trigger a false transition before the agents are registered.
+		if inSpawn {
+			if trimmed == "[/QUINOA:SPAWN]" {
+				instruction := strings.TrimSpace(spawnBuf.String())
 				if instruction != "" {
 					r.spawnParallelAgent(taskID, instruction)
 				}
+				inSpawn = false
+				spawnBuf.Reset()
+			} else {
+				if spawnBuf.Len() > 0 {
+					spawnBuf.WriteByte('\n')
+				}
+				spawnBuf.WriteString(line)
 			}
 			continue
 		}
 
-		// [QUINOA:RETURN_TO_DOING] — review agent found issues; flag for return once all done.
+		// ── New multi-line SPAWN start: [QUINOA:SPAWN] on its own line ─────
+		if trimmed == "[QUINOA:SPAWN]" {
+			inSpawn = true
+			spawnBuf.Reset()
+			continue
+		}
+
+		// ── Legacy single-line SPAWN: [QUINOA:SPAWN:instruction] ──────────
+		// Kept for backward-compatibility.  Only the single-line form is
+		// safe because multi-line emission causes false DONE triggers.
+		if idx := strings.Index(line, "[QUINOA:SPAWN:"); idx != -1 {
+			rest := line[idx+len("[QUINOA:SPAWN:"):]
+			if closeIdx := strings.Index(rest, "]"); closeIdx >= 0 {
+				instruction := strings.TrimSpace(rest[:closeIdx])
+				if instruction != "" {
+					r.spawnParallelAgent(taskID, instruction)
+				}
+			} else {
+				// No closing ] on this line — the instruction is multi-line.
+				// Enter accumulation mode to avoid false DONE triggers from
+				// [QUINOA:DONE] text that may appear inside the instruction body.
+				inSpawn = true
+				spawnBuf.Reset()
+				spawnBuf.WriteString(rest) // everything after [QUINOA:SPAWN:
+			}
+			continue
+		}
+
+		// ── [QUINOA:RETURN_TO_DOING] ───────────────────────────────────────
 		if strings.Contains(line, "[QUINOA:RETURN_TO_DOING]") {
 			story, sErr := r.getStoryForTask(taskID)
 			if sErr == nil && story.KanbanStatus == "review" {
@@ -203,6 +249,7 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 			continue
 		}
 
+		// ── [QUINOA:DONE] ─────────────────────────────────────────────────
 		if !strings.Contains(line, "[QUINOA:DONE]") {
 			continue
 		}
