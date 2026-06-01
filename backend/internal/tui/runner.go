@@ -107,9 +107,21 @@ func (r *Runner) runTask(cfg docker.RunConfig) {
 			finalStatus = "idle"
 		}
 		_ = r.db.UpdateTaskStatus(taskID, finalStatus, containerID)
-		if story, sErr := r.getStoryForTask(taskID); sErr == nil && story.KanbanStatus == "doing" {
-			if r.db.AllStoryTasksDone(story.ID) {
-				_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
+
+		story, sErr := r.getStoryForTask(taskID)
+		if sErr == nil {
+			switch story.KanbanStatus {
+			case "doing":
+				if r.db.AllStoryTasksDone(story.ID) {
+					r.transitionToReview(story)
+				}
+			case "review":
+				if finalStatus == "error" {
+					_ = r.db.SetReviewResult(story.ID, "issues")
+				}
+				if r.db.AllStoryTasksDone(story.ID) {
+					r.handleReviewComplete(story.ID)
+				}
 			}
 		}
 	}
@@ -152,17 +164,24 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Spawn signal: [QUINOA:SPAWN:<instruction>]
-		// Only valid while the story is in "doing". The agent (started from refine→doing)
-		// emits this after analyzing the PRD to request a parallel sub-agent.
+		// [QUINOA:SPAWN:<instruction>] — create a parallel sub-agent for the same story.
 		if idx := strings.Index(line, "[QUINOA:SPAWN:"); idx != -1 {
 			end := strings.Index(line[idx:], "]")
 			if end > 0 {
-				instruction := line[idx+len("[QUINOA:SPAWN:") : idx+end]
-				instruction = strings.TrimSpace(instruction)
+				instruction := strings.TrimSpace(line[idx+len("[QUINOA:SPAWN:") : idx+end])
 				if instruction != "" {
 					r.spawnParallelAgent(taskID, instruction)
 				}
+			}
+			continue
+		}
+
+		// [QUINOA:RETURN_TO_DOING] — review agent found issues; flag for return once all done.
+		if strings.Contains(line, "[QUINOA:RETURN_TO_DOING]") {
+			story, sErr := r.getStoryForTask(taskID)
+			if sErr == nil && story.KanbanStatus == "review" {
+				_ = r.db.SetReviewResult(story.ID, "issues")
+				log.Printf("task %s: issues flagged → will return to doing when all review agents finish", taskID)
 			}
 			continue
 		}
@@ -178,20 +197,134 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 		case "doing":
 			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)
 			if r.db.AllStoryTasksDone(story.ID) {
-				_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
-				log.Printf("task %s: último agente concluído → review", taskID)
+				r.transitionToReview(story)
 			} else {
-				log.Printf("task %s: agente concluído, aguardando demais agentes", taskID)
+				log.Printf("task %s: doing agent done, waiting for other agents", taskID)
+			}
+		case "review":
+			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)
+			if r.db.AllStoryTasksDone(story.ID) {
+				r.handleReviewComplete(story.ID)
+			} else {
+				log.Printf("task %s: review agent done, waiting for other agents", taskID)
 			}
 		case "refine":
-			// Task goes idle; story stays in refine so the user can review the PRD before promoting.
 			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)
 			r.verifyPRD(taskID, story.PrdPath)
-			log.Printf("task %s: refinement agent signalled done → PRD ready", taskID)
+			log.Printf("task %s: PM agent done → PRD ready for promotion", taskID)
 			vaultPath, _ := r.db.GetConfig(db.ConfigVaultPath)
 			triggerVaultUpdate(vaultPath, story.Title, story.Description, story.PrdPath, "Refinamento concluído")
 		}
 	}
+}
+
+// getBaseCommand returns the agent base command stored in the story's primary task.
+// Falls back to "claude --dangerously-skip-permissions" when not available.
+func (r *Runner) getBaseCommand(story *db.Story) string {
+	if story.TaskID != "" {
+		if task, err := r.db.GetTask(story.TaskID); err == nil && task.BaseCommand != "" {
+			return task.BaseCommand
+		}
+	}
+	return "claude --dangerously-skip-permissions"
+}
+
+// transitionToReview increments the review counter, resets review_result,
+// and auto-starts the Tech Lead Review agent.
+func (r *Runner) transitionToReview(story *db.Story) {
+	_ = r.db.IncrReviewCount(story.ID)
+	_ = r.db.SetReviewResult(story.ID, "")
+	r.autoStartReviewAgent(story)
+	log.Printf("story %s: all doing agents done → starting review", story.ID)
+}
+
+// autoStartReviewAgent creates and launches the Tech Lead Review agent.
+// It updates story.task_id to the new review task so the card badge reflects it.
+func (r *Runner) autoStartReviewAgent(story *db.Story) {
+	vaultPath, _ := r.db.GetConfig(db.ConfigVaultPath)
+	projectsPath, _ := r.db.GetConfig(db.ConfigProjectsPath)
+	baseCmd := r.getBaseCommand(story)
+
+	containerPRD := ""
+	if vaultPath != "" && story.PrdPath != "" {
+		if rel := strings.TrimPrefix(story.PrdPath, vaultPath); rel != story.PrdPath {
+			containerPRD = "/vault" + rel
+		}
+	}
+
+	hasReviewFeedback := story.ReviewCount > 1 // already been through at least one review cycle
+	prompt := buildTechLeadReviewPrompt(story.Title, containerPRD, projectsPath != "", hasReviewFeedback)
+	agentCmd := baseCmd + " " + shellQuote(prompt)
+
+	taskID := uuid.New().String()
+	cfg := docker.RunConfig{
+		TaskID:       taskID,
+		StoryID:      story.ID,
+		AgentCommand: agentCmd,
+		BaseCommand:  baseCmd,
+		VaultPath:    vaultPath,
+		ProjectsPath: projectsPath,
+	}
+	task, err := r.StartTask(cfg)
+	if err != nil {
+		log.Printf("story %s: autoStartReviewAgent failed: %v — moving to review without agent", story.ID, err)
+		_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
+		return
+	}
+	_ = r.db.UpdateStoryKanban(story.ID, "review", task.ID)
+	log.Printf("story %s: Tech Lead Review agent started %s", story.ID, task.ID)
+}
+
+// handleReviewComplete is called when all review tasks for a story have finished.
+// If any agent flagged issues it auto-starts a new doing cycle; otherwise marks as ready.
+func (r *Runner) handleReviewComplete(storyID string) {
+	story, err := r.db.GetStory(storyID)
+	if err != nil {
+		return
+	}
+	if story.ReviewResult == "issues" {
+		log.Printf("story %s: review found issues → auto-starting doing agent", storyID)
+		r.autoStartDoingAgent(story)
+	} else {
+		log.Printf("story %s: review passed → ready for human review", storyID)
+		_ = r.db.SetReviewResult(storyID, "ready")
+	}
+}
+
+// autoStartDoingAgent creates and launches a new Tech Lead Doing agent after review issues.
+// The story is moved back to "doing" and doing_count is incremented.
+func (r *Runner) autoStartDoingAgent(story *db.Story) {
+	vaultPath, _ := r.db.GetConfig(db.ConfigVaultPath)
+	projectsPath, _ := r.db.GetConfig(db.ConfigProjectsPath)
+	baseCmd := r.getBaseCommand(story)
+
+	containerPRD := ""
+	if vaultPath != "" && story.PrdPath != "" {
+		if rel := strings.TrimPrefix(story.PrdPath, vaultPath); rel != story.PrdPath {
+			containerPRD = "/vault" + rel
+		}
+	}
+
+	prompt := buildTechLeadDoingPrompt(story.Title, story.Description, containerPRD, projectsPath != "", true)
+	agentCmd := baseCmd + " " + shellQuote(prompt)
+
+	taskID := uuid.New().String()
+	cfg := docker.RunConfig{
+		TaskID:       taskID,
+		StoryID:      story.ID,
+		AgentCommand: agentCmd,
+		BaseCommand:  baseCmd,
+		VaultPath:    vaultPath,
+		ProjectsPath: projectsPath,
+	}
+	task, err := r.StartTask(cfg)
+	if err != nil {
+		log.Printf("story %s: autoStartDoingAgent failed: %v", story.ID, err)
+		return
+	}
+	_ = r.db.UpdateStoryKanban(story.ID, "doing", task.ID)
+	_ = r.db.IncrDoingCount(story.ID)
+	log.Printf("story %s: Tech Lead Doing agent restarted after review issues %s", story.ID, task.ID)
 }
 
 // spawnParallelAgent creates a new parallel agent for the same story.
@@ -203,8 +336,8 @@ func (r *Runner) spawnParallelAgent(parentTaskID, instruction string) {
 		return
 	}
 	story, err := r.db.GetStory(parent.StoryID)
-	if err != nil || story.KanbanStatus != "doing" {
-		log.Printf("task %s: SPAWN ignored — story not in doing", parentTaskID)
+	if err != nil || (story.KanbanStatus != "doing" && story.KanbanStatus != "review") {
+		log.Printf("task %s: SPAWN ignored — story not in doing/review (status=%s)", parentTaskID, story.KanbanStatus)
 		return
 	}
 

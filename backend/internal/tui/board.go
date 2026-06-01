@@ -658,7 +658,7 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 				}
 			}
 
-			prompt := buildAgentPrompt(story.Title, story.Description, containerPRD, projectsPath != "")
+			prompt := buildTechLeadDoingPrompt(story.Title, story.Description, containerPRD, projectsPath != "", false)
 			baseCmd := msg.Fields["agent_command"]
 			agentCmd := baseCmd + " " + shellQuote(prompt)
 
@@ -687,6 +687,7 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 			if err := m.db.UpdateStoryKanban(storyID, "doing", task.ID); err != nil {
 				return errMsg{err}
 			}
+			_ = m.db.IncrDoingCount(storyID)
 
 			stories, _ := m.db.ListStories()
 			return storiesLoadedMsg(stories)
@@ -709,7 +710,7 @@ func (m Model) handleFormDone(msg FormDone) (tea.Model, tea.Cmd) {
 				}
 			}
 
-			prompt := buildAgentPrompt(story.Title, story.Description, containerPRD, projectsPath != "")
+			prompt := buildTechLeadDoingPrompt(story.Title, story.Description, containerPRD, projectsPath != "", false)
 			baseCmd := msg.Fields["agent_command"]
 			agentCmd := baseCmd + " " + shellQuote(prompt)
 
@@ -1142,6 +1143,11 @@ func (m Model) renderCard(s *db.Story, selected bool, colIdx int, width int) str
 		parts = append(parts, styleCardDesc.Width(innerW).Render(desc))
 	}
 
+	// "Ready for human review" badge — shown in review column when all agents approved.
+	if s.ReviewResult == "ready" {
+		parts = append(parts, styleReadyBadge.Render("✓ pronto para revisão"))
+	}
+
 	if s.TaskStatus != "" {
 		badge := statusStyle(s.TaskStatus).Render(statusLabel(s.TaskStatus))
 		parts = append(parts, badge)
@@ -1151,6 +1157,13 @@ func (m Model) renderCard(s *db.Story, selected bool, colIdx int, width int) str
 	if colIdx == colRefine && s.PrdPath != "" {
 		prdLabel := "⌁ " + filepath.Base(s.PrdPath)
 		parts = append(parts, lipgloss.NewStyle().Foreground(colorPurple).Render(prdLabel))
+	}
+
+	// Cycle counters — shown when the card has been through at least one doing or review cycle.
+	if s.DoingCount > 0 || s.ReviewCount > 0 {
+		counter := lipgloss.NewStyle().Foreground(colorMuted).
+			Render(fmt.Sprintf("D:%d  R:%d", s.DoingCount, s.ReviewCount))
+		parts = append(parts, counter)
 	}
 
 	content := strings.Join(parts, "\n")
@@ -1274,33 +1287,51 @@ func buildPRDTemplate(title string) string {
 		"[Síntese da conversa, principais decisões e o raciocínio por trás delas]"
 }
 
-// buildAgentPrompt returns the prompt for a development agent.
-// containerPRDPath is the PRD path inside the container (empty if no vault/PRD).
-// hasProjects indicates whether /projects is mounted with the user's code.
-func buildAgentPrompt(storyTitle, storyDesc, containerPRDPath string, hasProjects bool) string {
-	prompt := storyTitle
+// buildTechLeadDoingPrompt returns the prompt for the Tech Lead agent in the Doing column.
+// The Tech Lead reads the PRD, identifies parallel independent tasks, delegates all of them
+// via [QUINOA:SPAWN:] signals, and signals [QUINOA:DONE] without implementing anything itself.
+// hasReviewFeedback=true means the story is returning from review with feedback in the PRD.
+func buildTechLeadDoingPrompt(storyTitle, storyDesc, containerPRDPath string, hasProjects, hasReviewFeedback bool) string {
+	intro := "Você é o Tech Lead responsável por orquestrar a implementação desta história.\n\n" +
+		"**Papel:** Analisar o PRD, decompor o trabalho em tarefas independentes e delegar cada uma " +
+		"a um agente especializado via [QUINOA:SPAWN:]. Você não implementa código — apenas coordena.\n\n" +
+		"**História:** " + storyTitle
 	if storyDesc != "" {
-		prompt += "\n\n" + storyDesc
+		intro += "\n\n" + storyDesc
 	}
+
 	if containerPRDPath != "" {
-		prompt += "\n\nLeia o PRD em " + containerPRDPath + ".\n" +
-			"Ele especifica os requisitos detalhados e indica qual projeto deve ser modificado.\n\n" +
-			"## Paralelismo de agentes\n\n" +
-			"Antes de começar a implementação, analise o PRD e verifique se existem partes da tarefa\n" +
-			"que podem ser desenvolvidas de forma **completamente independente** em paralelo\n" +
-			"(por exemplo: módulos distintos sem dependência entre si).\n\n" +
-			"Se sim, para cada sub-tarefa adicional emita **antes de começar seu próprio trabalho**:\n\n" +
-			"  [QUINOA:SPAWN:<instrução completa para o agente paralelo>]\n\n" +
-			"Cada instrução deve ser auto-contida: descreva o que o agente paralelo deve fazer,\n" +
-			"mencionando o PRD em " + containerPRDPath + " e o projeto relevante.\n" +
-			"Depois de emitir os spawns, execute a sua porção da tarefa normalmente.\n" +
-			"Se não houver paralelismo óbvio, omita os sinais e implemente tudo você mesmo."
+		if hasReviewFeedback {
+			intro += "\n\n⚠️  **Esta é uma iteração de correção pós-revisão.**\n" +
+				"O PRD foi atualizado com seções de feedback (\"## Feedback Code Review\", " +
+				"\"## Feedback QA\", \"## Feedback Segurança\"). " +
+				"Leia todas essas seções antes de delegar — os agentes devem corrigir especificamente os pontos levantados."
+		}
+		intro += "\n\n**PRD:** " + containerPRDPath
+		intro += "\n\n## Instruções\n\n" +
+			"1. Leia o PRD completo em " + containerPRDPath + "\n" +
+			"2. Identifique todas as tarefas técnicas necessárias (ex: endpoint de API, componente frontend, migration de banco, testes)\n" +
+			"3. Para cada tarefa independente, emita um sinal de spawn **antes de emitir [QUINOA:DONE]**:\n\n" +
+			"   ```\n" +
+			"   echo \"[QUINOA:SPAWN:<instrução autocontida para o agente>]\"\n" +
+			"   ```\n\n" +
+			"   A instrução deve conter: o que implementar, em qual projeto dentro de /projects, e que o PRD está em " + containerPRDPath + ".\n" +
+			"   Exemplo: `[QUINOA:SPAWN:Implemente o endpoint POST /api/users no projeto em /projects/backend. PRD em " + containerPRDPath + ". Adicione validação e testes unitários.]`\n\n" +
+			"4. Após emitir todos os spawns, sinalize sua conclusão:\n" +
+			"   ```\n" +
+			"   echo \"[QUINOA:DONE]\"\n" +
+			"   ```\n\n" +
+			"Se o PRD não indicar projetos separados ou todas as tarefas forem interdependentes, delegue tudo a um único agente via spawn."
+	} else {
+		intro += "\n\nNão há PRD disponível. Delegue a implementação completa da história a um agente via:\n" +
+			"   echo \"[QUINOA:SPAWN:<descrição completa da tarefa>]\"\n" +
+			"E depois: echo \"[QUINOA:DONE]\""
 	}
+
 	if hasProjects {
-		prompt += "\n\nOs projetos de código estão disponíveis em /projects. " +
-			"Identifique o projeto correto (a partir do PRD ou do contexto da história) e navegue até ele para implementar as alterações."
+		intro += "\n\nOs projetos de código estão disponíveis em /projects."
 	}
-	return prompt
+	return intro
 }
 
 // buildRefinementPrompt returns the full system prompt for a refinement agent.
@@ -1374,6 +1405,74 @@ func buildRefinementPrompt(storyTitle, storyDesc, containerPRDPath string, hasVa
 		tpl + "\n\n" +
 		"**Passo 2 — " + saveStep + "\n\n" +
 		"Comece a sessão explorando o contexto disponível, depois apresente-se e inicie o refinamento."
+}
+
+// buildTechLeadReviewPrompt returns the prompt for the Tech Lead Review agent.
+// The agent does code review then always spawns QA and Security agents in parallel.
+// hasReviewFeedback=true means there were previous review issues; the agent should focus
+// on verifying the feedback sections of the PRD were addressed before doing a full review.
+func buildTechLeadReviewPrompt(storyTitle, containerPRDPath string, hasProjects, hasReviewFeedback bool) string {
+	prdRef := ""
+	if containerPRDPath != "" {
+		prdRef = " O PRD está em " + containerPRDPath + "."
+	}
+	projectsRef := ""
+	if hasProjects {
+		projectsRef = " Os projetos de código estão em /projects."
+	}
+
+	focusNote := ""
+	if hasReviewFeedback {
+		focusNote = "\n\n⚠️  **Esta é uma revisão de iteração corretiva.**\n" +
+			"Antes de fazer o review completo, verifique se cada ponto das seções " +
+			"\"## Feedback Code Review\", \"## Feedback QA\" e \"## Feedback Segurança\" do PRD " +
+			"foi devidamente corrigido. Documente explicitamente se cada ponto foi resolvido."
+	}
+
+	qaInstruction := "Você é um agente de QA." + prdRef + projectsRef + "\n\n" +
+		"Sua tarefa:\n" +
+		"1. Leia o PRD para entender os critérios de aceitação\n" +
+		"2. Identifique o projeto modificado em /projects e execute os testes existentes\n" +
+		"3. Verifique cobertura de testes e se todos os critérios de aceitação foram atendidos\n" +
+		"4. Verifique casos de borda não tratados\n\n" +
+		"Se encontrar problemas:\n" +
+		"- Adicione ao final do PRD uma seção \"## Feedback QA\" descrevendo cada problema\n" +
+		"- Execute: echo \"[QUINOA:RETURN_TO_DOING]\"\n\n" +
+		"Execute ao final: echo \"[QUINOA:DONE]\""
+
+	secInstruction := "Você é um agente de segurança." + prdRef + projectsRef + "\n\n" +
+		"Sua tarefa:\n" +
+		"1. Leia o PRD para entender o contexto da implementação\n" +
+		"2. Revise o código em /projects buscando as seguintes vulnerabilidades:\n" +
+		"   - Injeção SQL / NoSQL\n" +
+		"   - XSS e CSRF\n" +
+		"   - Secrets ou credenciais expostas no código\n" +
+		"   - Autenticação ou autorização inadequada\n" +
+		"   - OWASP Top 10 relevantes ao contexto\n\n" +
+		"Se encontrar problemas:\n" +
+		"- Adicione ao final do PRD uma seção \"## Feedback Segurança\" descrevendo cada vulnerabilidade\n" +
+		"- Execute: echo \"[QUINOA:RETURN_TO_DOING]\"\n\n" +
+		"Execute ao final: echo \"[QUINOA:DONE]\""
+
+	return "Você é o Tech Lead responsável pela revisão desta história: **" + storyTitle + "**." +
+		prdRef + projectsRef + focusNote + "\n\n" +
+		"## Passos\n\n" +
+		"1. **Leia o PRD** em " + containerPRDPath + " para entender o que deveria ter sido implementado\n" +
+		"2. **Localize o código modificado**: navegue pelos projetos em /projects, use `git log --oneline -20` e `git diff` para ver as mudanças recentes\n" +
+		"3. **Realize o code review** verificando:\n" +
+		"   - Correção funcional em relação ao PRD\n" +
+		"   - Qualidade e clareza do código\n" +
+		"   - Padrões e arquitetura do projeto\n" +
+		"   - Ausência de código morto ou debug\n" +
+		"4. **Se encontrar problemas no code review**:\n" +
+		"   - Adicione ao final do PRD uma seção \"## Feedback Code Review\" com os problemas encontrados\n" +
+		"   - Execute: `echo \"[QUINOA:RETURN_TO_DOING]\"`\n" +
+		"5. **Independentemente do resultado do code review**, spawne os agentes de QA e Segurança:\n" +
+		"   ```\n" +
+		"   echo \"[QUINOA:SPAWN:" + qaInstruction + "]\"\n" +
+		"   echo \"[QUINOA:SPAWN:" + secInstruction + "]\"\n" +
+		"   ```\n" +
+		"6. Execute ao final: `echo \"[QUINOA:DONE]\"`"
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)

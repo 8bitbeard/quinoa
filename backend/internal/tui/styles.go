@@ -98,6 +98,10 @@ var (
 	styleColFocused = lipgloss.NewStyle().
 			Foreground(colorAccent).
 			Bold(true)
+
+	styleReadyBadge = lipgloss.NewStyle().
+			Foreground(colorGreen).
+			Bold(true)
 )
 
 func statusStyle(status string) lipgloss.Style {

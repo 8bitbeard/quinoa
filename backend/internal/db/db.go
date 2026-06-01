@@ -31,6 +31,9 @@ type Story struct {
 	TaskID       string    `json:"task_id"`
 	TaskStatus   string    `json:"task_status"` // populated via LEFT JOIN tasks
 	PrdPath      string    `json:"prd_path"`
+	DoingCount   int       `json:"doing_count"`
+	ReviewCount  int       `json:"review_count"`
+	ReviewResult string    `json:"review_result"` // "", "issues", "ready"
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -80,6 +83,9 @@ func (d *DB) migrate() error {
 	d.Exec(`ALTER TABLE stories ADD COLUMN prd_path TEXT NOT NULL DEFAULT ''`)
 	d.Exec(`ALTER TABLE tasks ADD COLUMN story_id TEXT NOT NULL DEFAULT ''`)
 	d.Exec(`ALTER TABLE tasks ADD COLUMN base_command TEXT NOT NULL DEFAULT ''`)
+	d.Exec(`ALTER TABLE stories ADD COLUMN doing_count INT NOT NULL DEFAULT 0`)
+	d.Exec(`ALTER TABLE stories ADD COLUMN review_count INT NOT NULL DEFAULT 0`)
+	d.Exec(`ALTER TABLE stories ADD COLUMN review_result TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
@@ -209,7 +215,7 @@ func (d *DB) ListStories() ([]*Story, error) {
 	rows, err := d.Query(`
 		SELECT s.id, s.title, s.description, s.kanban_status, s.task_id,
 		       COALESCE(t.status, '') AS task_status,
-		       s.prd_path,
+		       s.prd_path, s.doing_count, s.review_count, s.review_result,
 		       s.created_at, s.updated_at
 		FROM stories s
 		LEFT JOIN tasks t ON s.task_id = t.id AND s.task_id != ''
@@ -222,7 +228,8 @@ func (d *DB) ListStories() ([]*Story, error) {
 	for rows.Next() {
 		s := &Story{}
 		if err := rows.Scan(&s.ID, &s.Title, &s.Description, &s.KanbanStatus, &s.TaskID,
-			&s.TaskStatus, &s.PrdPath, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			&s.TaskStatus, &s.PrdPath, &s.DoingCount, &s.ReviewCount, &s.ReviewResult,
+			&s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		stories = append(stories, s)
@@ -234,14 +241,15 @@ func (d *DB) GetStory(id string) (*Story, error) {
 	row := d.QueryRow(`
 		SELECT s.id, s.title, s.description, s.kanban_status, s.task_id,
 		       COALESCE(t.status, '') AS task_status,
-		       s.prd_path,
+		       s.prd_path, s.doing_count, s.review_count, s.review_result,
 		       s.created_at, s.updated_at
 		FROM stories s
 		LEFT JOIN tasks t ON s.task_id = t.id AND s.task_id != ''
 		WHERE s.id = ?`, id)
 	s := &Story{}
 	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.KanbanStatus, &s.TaskID,
-		&s.TaskStatus, &s.PrdPath, &s.CreatedAt, &s.UpdatedAt)
+		&s.TaskStatus, &s.PrdPath, &s.DoingCount, &s.ReviewCount, &s.ReviewResult,
+		&s.CreatedAt, &s.UpdatedAt)
 	return s, err
 }
 
@@ -260,19 +268,38 @@ func (d *DB) GetStoryByTaskID(taskID string) (*Story, error) {
 	row := d.QueryRow(`
 		SELECT s.id, s.title, s.description, s.kanban_status, s.task_id,
 		       COALESCE(t.status, '') AS task_status,
-		       s.prd_path,
+		       s.prd_path, s.doing_count, s.review_count, s.review_result,
 		       s.created_at, s.updated_at
 		FROM stories s
 		LEFT JOIN tasks t ON s.task_id = t.id AND s.task_id != ''
 		WHERE s.task_id = ?`, taskID)
 	s := &Story{}
 	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.KanbanStatus, &s.TaskID,
-		&s.TaskStatus, &s.PrdPath, &s.CreatedAt, &s.UpdatedAt)
+		&s.TaskStatus, &s.PrdPath, &s.DoingCount, &s.ReviewCount, &s.ReviewResult,
+		&s.CreatedAt, &s.UpdatedAt)
 	return s, err
 }
 
 func (d *DB) UpdateStoryPRD(id, prdPath string) error {
 	_, err := d.Exec(`UPDATE stories SET prd_path=?, updated_at=? WHERE id=?`,
 		prdPath, time.Now().UTC(), id)
+	return err
+}
+
+func (d *DB) IncrDoingCount(id string) error {
+	_, err := d.Exec(`UPDATE stories SET doing_count=doing_count+1, updated_at=? WHERE id=?`,
+		time.Now().UTC(), id)
+	return err
+}
+
+func (d *DB) IncrReviewCount(id string) error {
+	_, err := d.Exec(`UPDATE stories SET review_count=review_count+1, updated_at=? WHERE id=?`,
+		time.Now().UTC(), id)
+	return err
+}
+
+func (d *DB) SetReviewResult(id, result string) error {
+	_, err := d.Exec(`UPDATE stories SET review_result=?, updated_at=? WHERE id=?`,
+		result, time.Now().UTC(), id)
 	return err
 }
