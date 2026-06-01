@@ -16,8 +16,8 @@ fi
 
 echo "[quinoa] configurando credenciais do agente..."
 
-# Mark the workspace (and /projects if present) as trusted in ~/.claude.json
-# so Claude Code does not show the "Do you trust the files in this folder?" dialog.
+# Mark a path as trusted in ~/.claude.json so Claude Code skips the
+# "Do you trust the files in this folder?" dialog for that directory.
 trust_path() {
     local p="$1"
     if [ -f "$HOME/.claude.json" ]; then
@@ -29,11 +29,6 @@ trust_path() {
         printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$p" > "$HOME/.claude.json"
     fi
 }
-
-trust_path "$WORK_DIR"
-if [[ -d "/projects" ]]; then
-    trust_path "/projects"
-fi
 
 echo "[quinoa] iniciando setup..."
 
@@ -84,6 +79,18 @@ else
 fi
 
 cd "$WORK_DIR"
+
+# Trust the actual working directory (resolved after all WORK_DIR reassignments above),
+# plus any mounted volumes the agent may navigate into.
+trust_path "$WORK_DIR"
+[[ -d "/projects" ]] && trust_path "/projects"
+[[ -d "/vault" ]]    && trust_path "/vault"
+
+# Place a .claude/settings.json in the working directory so Claude Code enters
+# bypassPermissions mode without showing the "--dangerously-skip-permissions" confirmation.
+mkdir -p ".claude"
+printf '{"defaultMode":"bypassPermissions"}\n' > ".claude/settings.json"
+
 echo "[quinoa] setup concluído — iniciando agente..."
 echo ""
 
