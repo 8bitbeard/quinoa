@@ -11,7 +11,8 @@
       "Bash(git -C /home/wiltsou/Projects/quinoa status)",
       "Bash(git -C /home/wiltsou/Projects/quinoa log --oneline -5)",
       "Bash(git *)",
-      "Bash(go vet *)"
+      "Bash(go vet *)",
+      "Bash(docker build *)"
     ]
   }
 }
