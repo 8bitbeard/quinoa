@@ -108,7 +108,9 @@ func (r *Runner) runTask(cfg docker.RunConfig) {
 		}
 		_ = r.db.UpdateTaskStatus(taskID, finalStatus, containerID)
 		if story, sErr := r.getStoryForTask(taskID); sErr == nil && story.KanbanStatus == "doing" {
-			_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
+			if r.db.AllStoryTasksDone(story.ID) {
+				_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
+			}
 		}
 	}
 
@@ -175,8 +177,12 @@ func (r *Runner) watchForDoneSignal(taskID, containerID string) {
 		switch story.KanbanStatus {
 		case "doing":
 			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)
-			_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
-			log.Printf("task %s: agent signalled completion → review", taskID)
+			if r.db.AllStoryTasksDone(story.ID) {
+				_ = r.db.UpdateStoryKanban(story.ID, "review", story.TaskID)
+				log.Printf("task %s: último agente concluído → review", taskID)
+			} else {
+				log.Printf("task %s: agente concluído, aguardando demais agentes", taskID)
+			}
 		case "refine":
 			// Task goes idle; story stays in refine so the user can review the PRD before promoting.
 			_ = r.db.UpdateTaskStatus(taskID, "idle", containerID)

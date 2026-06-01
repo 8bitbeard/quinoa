@@ -171,6 +171,18 @@ func (d *DB) ListTasksByStory(storyID string) ([]*Task, error) {
 	return tasks, rows.Err()
 }
 
+// AllStoryTasksDone returns true when no task linked to storyID is still
+// running or pending. Used to avoid moving a story to "review" while parallel
+// agents are still executing.
+func (d *DB) AllStoryTasksDone(storyID string) bool {
+	var count int
+	err := d.QueryRow(
+		`SELECT COUNT(*) FROM tasks WHERE story_id=? AND status IN ('running','pending')`,
+		storyID,
+	).Scan(&count)
+	return err == nil && count == 0
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }
