@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,6 +38,8 @@ func (r *Runner) StartTask(cfg docker.RunConfig) (*db.Task, error) {
 		RepoBranch:   cfg.RepoBranch,
 		AgentCommand: cfg.AgentCommand,
 		BaseCommand:  cfg.BaseCommand,
+		AgentName:    cfg.AgentName,
+		Stage:        cfg.Stage,
 		Status:       "pending",
 	}
 	if err := r.db.InsertTask(task); err != nil {
@@ -96,12 +99,26 @@ func (r *Runner) runTask(cfg docker.RunConfig) {
 	_ = r.db.UpdateTaskStatus(taskID, "running", containerID)
 	log.Printf("task %s: container started: %s", taskID, containerID[:12])
 
-	go r.watchForDoneSignal(taskID, containerID)
+	// watchForDoneSignal runs concurrently processing [QUINOA:SPAWN:] and [QUINOA:DONE]
+	// signals from the log stream. We must wait for it to finish before checking
+	// AllStoryTasksDone, otherwise we may transition before spawned agents are in the DB.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.watchForDoneSignal(taskID, containerID)
+	}()
 
 	exitCode, err := r.docker.WaitContainer(ctx, containerID)
 	log.Printf("task %s: container exited exit=%d", taskID, exitCode)
 
+	// Wait for the log watcher to finish processing all signals before
+	// making any transition decision. The Docker log stream closes when
+	// the container exits, so this should return promptly.
+	wg.Wait()
+
 	if cur, _ := r.db.GetTask(taskID); cur != nil && cur.Status == "running" {
+		// watchForDoneSignal did not see [QUINOA:DONE] — the container exited without signaling.
 		finalStatus := "error"
 		if err == nil && exitCode == 0 {
 			finalStatus = "idle"
@@ -262,6 +279,8 @@ func (r *Runner) autoStartReviewAgent(story *db.Story) {
 		StoryID:      story.ID,
 		AgentCommand: agentCmd,
 		BaseCommand:  baseCmd,
+		AgentName:    "TechLead",
+		Stage:        "review",
 		VaultPath:    vaultPath,
 		ProjectsPath: projectsPath,
 	}
@@ -314,6 +333,8 @@ func (r *Runner) autoStartDoingAgent(story *db.Story) {
 		StoryID:      story.ID,
 		AgentCommand: agentCmd,
 		BaseCommand:  baseCmd,
+		AgentName:    "TechLead",
+		Stage:        "doing",
 		VaultPath:    vaultPath,
 		ProjectsPath: projectsPath,
 	}
@@ -356,12 +377,21 @@ func (r *Runner) spawnParallelAgent(parentTaskID, instruction string) {
 		agentCmd = parent.BaseCommand + " " + shellQuote(instruction+"\n\nPRD disponível em: "+containerPRD)
 	}
 
+	// Inherit stage from parent; derive a human-readable name from the instruction.
+	stage := parent.Stage
+	if stage == "" {
+		stage = story.KanbanStatus
+	}
+	agentName := deriveAgentName(instruction)
+
 	taskID := uuid.New().String()
 	cfg := docker.RunConfig{
 		TaskID:       taskID,
 		StoryID:      parent.StoryID,
 		AgentCommand: agentCmd,
 		BaseCommand:  parent.BaseCommand,
+		AgentName:    agentName,
+		Stage:        stage,
 		VaultPath:    vaultPath,
 		ProjectsPath: projectsPath,
 	}
@@ -369,5 +399,26 @@ func (r *Runner) spawnParallelAgent(parentTaskID, instruction string) {
 		log.Printf("task %s: SPAWN failed: %v", parentTaskID, err)
 		return
 	}
-	log.Printf("task %s: spawned parallel agent %s", parentTaskID, taskID)
+	log.Printf("task %s: spawned parallel agent %s (%s)", parentTaskID, taskID, agentName)
+}
+
+// deriveAgentName infers a human-readable role label from a spawn instruction.
+func deriveAgentName(instruction string) string {
+	lower := strings.ToLower(instruction)
+	switch {
+	case strings.Contains(lower, "agente de qa") || strings.HasPrefix(lower, "você é um agente de qa"):
+		return "QA"
+	case strings.Contains(lower, "agente de segurança") || strings.Contains(lower, "agente de security"):
+		return "Segurança"
+	case strings.Contains(lower, "frontend") || strings.Contains(lower, "front-end"):
+		return "Frontend"
+	case strings.Contains(lower, "backend") || strings.Contains(lower, "back-end"):
+		return "Backend"
+	case strings.Contains(lower, "banco de dados") || strings.Contains(lower, "database") || strings.Contains(lower, "migration"):
+		return "Banco de Dados"
+	case strings.Contains(lower, "testes") || strings.Contains(lower, "tests"):
+		return "Testes"
+	default:
+		return "Agente"
+	}
 }

@@ -27,6 +27,8 @@ type RunConfig struct {
 	RepoBranch   string
 	AgentCommand string
 	BaseCommand  string   // agent binary + flags without the prompt (e.g. "claude --dangerously-skip-permissions")
+	AgentName    string   // human-readable role label (PM, TechLead, QA, etc.)
+	Stage        string   // kanban stage: refine, doing, review
 	EnvExtra     []string
 	VaultPath    string // Obsidian vault — bind-mounted at /vault (optional)
 	ProjectsPath string // local projects root — bind-mounted at /projects (optional)

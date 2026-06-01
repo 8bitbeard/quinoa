@@ -17,8 +17,10 @@ type Task struct {
 	RepoBranch   string    `json:"repo_branch"`
 	AgentCommand string    `json:"agent_command"`
 	BaseCommand  string    `json:"base_command"` // agent binary + flags, without the prompt
+	AgentName    string    `json:"agent_name"`   // human-readable agent role (PM, TechLead, QA, etc.)
+	Stage        string    `json:"stage"`        // kanban stage when agent was created (refine, doing, review)
 	ContainerID  string    `json:"container_id"`
-	Status       string    `json:"status"` // pending, running, done, error, stopped
+	Status       string    `json:"status"` // pending, running, idle, error, stopped
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -86,6 +88,8 @@ func (d *DB) migrate() error {
 	d.Exec(`ALTER TABLE stories ADD COLUMN doing_count INT NOT NULL DEFAULT 0`)
 	d.Exec(`ALTER TABLE stories ADD COLUMN review_count INT NOT NULL DEFAULT 0`)
 	d.Exec(`ALTER TABLE stories ADD COLUMN review_result TEXT NOT NULL DEFAULT ''`)
+	d.Exec(`ALTER TABLE tasks ADD COLUMN agent_name TEXT NOT NULL DEFAULT ''`)
+	d.Exec(`ALTER TABLE tasks ADD COLUMN stage TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
@@ -117,9 +121,9 @@ func (d *DB) InsertTask(t *Task) error {
 	t.CreatedAt = now
 	t.UpdatedAt = now
 	_, err := d.Exec(`
-		INSERT INTO tasks (id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, container_id, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.StoryID, t.RepoURL, t.RepoPath, t.RepoBranch, t.AgentCommand, t.BaseCommand, t.ContainerID, t.Status, t.CreatedAt, t.UpdatedAt,
+		INSERT INTO tasks (id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, agent_name, stage, container_id, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.StoryID, t.RepoURL, t.RepoPath, t.RepoBranch, t.AgentCommand, t.BaseCommand, t.AgentName, t.Stage, t.ContainerID, t.Status, t.CreatedAt, t.UpdatedAt,
 	)
 	return err
 }
@@ -132,14 +136,14 @@ func (d *DB) UpdateTaskStatus(id, status, containerID string) error {
 
 func (d *DB) GetTask(id string) (*Task, error) {
 	row := d.QueryRow(`
-		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, container_id, status, created_at, updated_at
+		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, agent_name, stage, container_id, status, created_at, updated_at
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
 }
 
 func (d *DB) ListTasks() ([]*Task, error) {
 	rows, err := d.Query(`
-		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, container_id, status, created_at, updated_at
+		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, agent_name, stage, container_id, status, created_at, updated_at
 		FROM tasks ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -159,7 +163,7 @@ func (d *DB) ListTasks() ([]*Task, error) {
 
 func (d *DB) ListTasksByStory(storyID string) ([]*Task, error) {
 	rows, err := d.Query(`
-		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, container_id, status, created_at, updated_at
+		SELECT id, story_id, repo_url, repo_path, repo_branch, agent_command, base_command, agent_name, stage, container_id, status, created_at, updated_at
 		FROM tasks WHERE story_id=? ORDER BY created_at ASC`, storyID)
 	if err != nil {
 		return nil, err
@@ -195,7 +199,7 @@ type scanner interface {
 
 func scanTask(s scanner) (*Task, error) {
 	t := &Task{}
-	err := s.Scan(&t.ID, &t.StoryID, &t.RepoURL, &t.RepoPath, &t.RepoBranch, &t.AgentCommand, &t.BaseCommand, &t.ContainerID, &t.Status, &t.CreatedAt, &t.UpdatedAt)
+	err := s.Scan(&t.ID, &t.StoryID, &t.RepoURL, &t.RepoPath, &t.RepoBranch, &t.AgentCommand, &t.BaseCommand, &t.AgentName, &t.Stage, &t.ContainerID, &t.Status, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }
 
